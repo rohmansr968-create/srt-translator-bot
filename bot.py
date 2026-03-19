@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-🎬 SRT Subtitle Translator Bot
-বাংলা সাবটাইটেল অনুবাদক | Powered by Groq AI
-"""
-
 import os, re, io, time, asyncio, logging, threading, requests
 from concurrent.futures import ThreadPoolExecutor
 
