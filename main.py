@@ -2,7 +2,7 @@
 """
 🎬 SRT Subtitle Translator Bot — Final Version
 বাংলা সাবটাইটেল অনুবাদক | Powered by Groq AI
-Features: Translate · Cancel · SubDL Search · AI Chat · Quota Error Handling
+Features: Translate · Cancel · SubDL Search · AI Chat · Quota Error · Strict Membership
 Python 3.11 | PTB 20.7
 """
 
@@ -43,7 +43,7 @@ executor      = ThreadPoolExecutor(max_workers=4)
 active_tasks  = {}   # {uid: False=running | True=cancelled}
 cancel_events = {}   # {uid: threading.Event}
 chat_mode     = {}   # {uid: bool}
-chat_history  = {}   # {uid: [{role, content}]}
+chat_history  = {}   # {uid: [{role,content}]}
 
 # ══════════════════════════════════════════════
 # 🌐  FLASK
@@ -174,7 +174,7 @@ def generate_pie_chart(completed: int, total: int) -> io.BytesIO:
     return buf
 
 # ══════════════════════════════════════════════
-# 🤖  SUBTITLE TRANSLATION
+# 🤖  TRANSLATION
 # ══════════════════════════════════════════════
 TRANSLATE_SYSTEM = (
     "তুমি একজন পেশাদার চলচ্চিত্র সাবটাইটেল অনুবাদক।\n"
@@ -223,7 +223,6 @@ def translate_one_sync(text: str, cancel_event=None) -> str:
                 time.sleep(3)
     return text
 
-
 def translate_batch_sync(texts: list, cancel_event=None) -> list:
     if cancel_event and cancel_event.is_set():
         return texts
@@ -267,7 +266,6 @@ def translate_batch_sync(texts: list, cancel_event=None) -> list:
                 logger.error(f"Batch error: {e}")
                 time.sleep(5)
 
-    # fallback: missing লাইন আলাদাভাবে অনুবাদ
     for i, val in enumerate(translated):
         if val is None:
             if cancel_event and cancel_event.is_set():
@@ -290,11 +288,9 @@ MAX_CHAT_HISTORY = 20
 def ai_chat_sync(uid: int, user_text: str) -> str:
     if uid not in chat_history:
         chat_history[uid] = []
-
     chat_history[uid].append({"role": "user", "content": user_text})
     if len(chat_history[uid]) > MAX_CHAT_HISTORY:
         chat_history[uid] = chat_history[uid][-MAX_CHAT_HISTORY:]
-
     try:
         resp = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -339,18 +335,20 @@ def subdl_download(url_path: str):
         logger.error(f"SubDL download: {e}"); return None
 
 # ══════════════════════════════════════════════
-# 🔒  CHANNEL CHECK
+# 🔒  CHANNEL MEMBERSHIP — প্রতিটি request-এ চেক হয়
 # ══════════════════════════════════════════════
 async def is_member(uid: int, bot) -> bool:
+    """
+    Telegram API সরাসরি call করে real-time চেক করে।
+    কোনো cache নেই — leave করলে সাথে সাথে access বন্ধ।
+    """
     try:
         m = await bot.get_chat_member(CHANNEL_USERNAME, uid)
         return m.status in ['member', 'administrator', 'creator']
     except Exception as e:
-        logger.warning(f"Member check: {e}"); return False
+        logger.warning(f"Member check error: {e}")
+        return False
 
-# ══════════════════════════════════════════════
-# 🎹  KEYBOARDS
-# ══════════════════════════════════════════════
 def kb_not_joined():
     ch = CHANNEL_USERNAME.lstrip('@')
     return InlineKeyboardMarkup([
@@ -358,6 +356,29 @@ def kb_not_joined():
         [InlineKeyboardButton("✅ যোগ দিয়েছি — চেক করো", callback_data="chk")]
     ])
 
+NOT_JOINED_MSG = (
+    "🔒 *চ্যানেল Membership নেই!*\n\n"
+    "বট ব্যবহার করতে চ্যানেলে যোগ দিতে হবে।\n"
+    "চ্যানেল থেকে leave নিলে বট access বন্ধ হয়ে যাবে।"
+)
+
+async def check_and_reject(uid: int, bot, reply_func) -> bool:
+    """
+    False মানে member নয় → access block করো
+    True মানে member → চলতে দাও
+    """
+    if not await is_member(uid, bot):
+        await reply_func(
+            NOT_JOINED_MSG,
+            parse_mode='Markdown',
+            reply_markup=kb_not_joined()
+        )
+        return False
+    return True
+
+# ══════════════════════════════════════════════
+# 🎹  KEYBOARDS
+# ══════════════════════════════════════════════
 def kb_home():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📖 ব্যবহার বিধি",  callback_data="help"),
@@ -401,9 +422,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not await is_member(u.id, ctx.bot):
         await update.message.reply_text(
-            "🔒 *বট ব্যবহার করতে প্রথমে চ্যানেলে যোগ দাও!*\n\n"
-            f"📢 চ্যানেল: `{CHANNEL_USERNAME}`",
-            parse_mode='Markdown', reply_markup=kb_not_joined())
+            NOT_JOINED_MSG, parse_mode='Markdown',
+            reply_markup=kb_not_joined())
         return
 
     chat_mode[u.id] = False
@@ -422,16 +442,32 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown', reply_markup=kb_home())
 
 # ══════════════════════════════════════════════
-# CALLBACK HANDLER
+# CALLBACK HANDLER — প্রতিটি button-এ membership চেক
 # ══════════════════════════════════════════════
 async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    d   = q.data
+    q   = update.callback_query
     uid = q.from_user.id
+    d   = q.data
 
-    # ── Cancel translation ──
+    # ── "চেক করো" বাটন — membership verify ──
+    if d == "chk":
+        await q.answer()
+        if await is_member(uid, ctx.bot):
+            chat_mode[uid] = False
+            await q.edit_message_text(
+                "✅ *দারুণ! চ্যানেলে যোগ দিয়েছ!*\n\n"
+                "`.srt` ফাইল পাঠাও অনুবাদ শুরু করতে 🚀",
+                parse_mode='Markdown', reply_markup=kb_home())
+        else:
+            await q.edit_message_text(
+                "❌ *এখনো যোগ দাওনি!*\n\n"
+                "চ্যানেলে যোগ দাও, তারপর চেক করো।",
+                parse_mode='Markdown', reply_markup=kb_not_joined())
+        return
+
+    # ── Cancel বাটন — membership check দরকার নেই ──
     if d.startswith("cancel_"):
+        await q.answer()
         target = int(d.split("_")[1])
         if uid == target and uid in active_tasks:
             active_tasks[uid] = True
@@ -447,6 +483,22 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await q.answer("কোনো সক্রিয় অনুবাদ নেই!", show_alert=True)
         return
+
+    # ══════════════════════════════════════════
+    # ✅ এখান থেকে প্রতিটি callback-এ membership চেক
+    # ══════════════════════════════════════════
+    if not await is_member(uid, ctx.bot):
+        await q.answer("🔒 চ্যানেলে যোগ দাও!", show_alert=True)
+        try:
+            await q.edit_message_text(
+                NOT_JOINED_MSG,
+                parse_mode='Markdown',
+                reply_markup=kb_not_joined())
+        except Exception:
+            pass
+        return
+
+    await q.answer()
 
     # ── SubDL download ──
     if d.startswith("subdl_"):
@@ -473,7 +525,7 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     for name in z.namelist():
                         if name.lower().endswith('.srt'):
                             srt_bytes = z.read(name)
-                            fname     = os.path.basename(name)
+                            fname = os.path.basename(name)
                             break
             except Exception as e:
                 logger.error(f"Zip: {e}")
@@ -499,7 +551,7 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "এখন যা মনে চায় লেখো — আমি বাংলায় উত্তর দেব। 🤖\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
             "📌 SRT ফাইল পাঠালে অনুবাদ হবে\n"
-            "🗑 পুরো কথোপকথন মুছতে নিচের বাটন\n"
+            "🗑 কথোপকথন মুছতে নিচের বাটন\n"
             "🔙 চ্যাট বন্ধ করতে নিচের বাটন",
             parse_mode='Markdown', reply_markup=kb_chat())
         return
@@ -508,7 +560,7 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat_history[uid] = []
         await q.edit_message_text(
             "🗑 *কথোপকথন মুছে ফেলা হয়েছে!*\n\n"
-            "নতুনভাবে শুরু করো — যা মনে চায় লেখো। 😊",
+            "নতুনভাবে শুরু করো 😊",
             parse_mode='Markdown', reply_markup=kb_chat())
         return
 
@@ -521,18 +573,7 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Standard buttons ──
-    if d == "chk":
-        if await is_member(uid, ctx.bot):
-            await q.edit_message_text(
-                "✅ *দারুণ! চ্যানেলে যোগ দিয়েছ!*\n\n"
-                "`.srt` ফাইল পাঠাও অনুবাদ শুরু করতে 🚀",
-                parse_mode='Markdown', reply_markup=kb_home())
-        else:
-            await q.edit_message_text(
-                "❌ *এখনো যোগ দাওনি!*\n\nযোগ দাও, তারপর চেক করো।",
-                parse_mode='Markdown', reply_markup=kb_not_joined())
-
-    elif d == "help":
+    if d == "help":
         await q.edit_message_text(
             "📖 *ব্যবহার বিধি*\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
@@ -569,7 +610,7 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "• তাৎক্ষণিক Cancel সাপোর্ট\n"
             "• Subtitle খোঁজা ও ডাউনলোড\n"
             "• বাংলায় AI চ্যাট\n"
-            "• API limit শেষে স্বয়ংক্রিয় সতর্কতা",
+            "• চ্যানেল leave করলে সাথে সাথে access বন্ধ",
             parse_mode='Markdown', reply_markup=kb_back())
 
     elif d == "status":
@@ -621,10 +662,12 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u   = update.effective_user
     doc = update.message.document
 
+    # ── Real-time membership check ──
     if not await is_member(u.id, ctx.bot):
         await update.message.reply_text(
-            "🔒 বট ব্যবহার করতে চ্যানেলে যোগ দাও!",
-            reply_markup=kb_not_joined()); return
+            NOT_JOINED_MSG, parse_mode='Markdown',
+            reply_markup=kb_not_joined())
+        return
 
     if not doc.file_name.lower().endswith('.srt'):
         await update.message.reply_text(
@@ -642,10 +685,10 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "আগেরটা শেষ করো বা Cancel করো।",
             parse_mode='Markdown'); return
 
-    chat_mode[u.id]      = False
-    active_tasks[u.id]   = False
-    cancel_events[u.id]  = threading.Event()
-    c_event              = cancel_events[u.id]
+    chat_mode[u.id]     = False
+    active_tasks[u.id]  = False
+    cancel_events[u.id] = threading.Event()
+    c_event             = cancel_events[u.id]
 
     status = await update.message.reply_photo(
         photo=generate_pie_chart(0, 1),
@@ -667,15 +710,13 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not srt_text:
             await status.edit_caption(
                 "❌ ফাইল পড়তে পারছি না! UTF-8 দিয়ে সেভ করো.",
-                parse_mode='Markdown')
-            return
+                parse_mode='Markdown'); return
 
         blocks = parse_srt(srt_text)
         if not blocks:
             await status.edit_caption(
                 "❌ SRT ফাইলে কোনো সাবটাইটেল নেই!",
-                parse_mode='Markdown')
-            return
+                parse_mode='Markdown'); return
 
         total = len(blocks)
 
@@ -694,7 +735,6 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         loop       = asyncio.get_event_loop()
 
         for i in range(0, total, BATCH):
-
             if c_event.is_set() or active_tasks.get(u.id, False):
                 logger.info(f"Cancelled: {u.id}"); return
 
@@ -781,18 +821,13 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     notice, parse_mode='Markdown',
                     reply_markup=kb_quota_error())
         else:
-            notice = (
-                f"❌ *সমস্যা হয়েছে!*\n\n"
-                f"`{err_msg[:200]}`\n\nআবার চেষ্টা করো।"
-            )
+            notice = f"❌ *সমস্যা হয়েছে!*\n\n`{err_msg[:200]}`\n\nআবার চেষ্টা করো।"
             try:
                 await status.edit_caption(
-                    notice, parse_mode='Markdown',
-                    reply_markup=kb_home())
+                    notice, parse_mode='Markdown', reply_markup=kb_home())
             except Exception:
                 await update.message.reply_text(
-                    notice, parse_mode='Markdown',
-                    reply_markup=kb_home())
+                    notice, parse_mode='Markdown', reply_markup=kb_home())
     finally:
         active_tasks.pop(u.id, None)
         cancel_events.pop(u.id, None)
@@ -804,19 +839,20 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u    = update.effective_user
     text = update.message.text.strip()
 
+    # ── Real-time membership check ──
     if not await is_member(u.id, ctx.bot):
         await update.message.reply_text(
-            "🔒 বট ব্যবহার করতে চ্যানেলে যোগ দাও!",
-            reply_markup=kb_not_joined()); return
+            NOT_JOINED_MSG, parse_mode='Markdown',
+            reply_markup=kb_not_joined())
+        return
 
     # ── Search mode ──
     if ctx.user_data.get('awaiting_search'):
         ctx.user_data['awaiting_search'] = False
-
         msg  = await update.message.reply_text(
             f"🔍 *খোঁজা হচ্ছে:* `{text}`\n\n⏳ একটু অপেক্ষা করো...",
             parse_mode='Markdown')
-        loop = asyncio.get_event_loop()
+        loop    = asyncio.get_event_loop()
         results = await loop.run_in_executor(executor, subdl_search, text)
 
         if not results:
@@ -838,19 +874,15 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             url_path = item.get('url', '')
             year     = item.get('year', '')
             fname    = (item.get('release_name', f'subtitle_{i}') + '.srt')[:60]
-
             ctx.user_data[f"suburl_{i}"]  = url_path
             ctx.user_data[f"subname_{i}"] = fname
-
             yr    = f" ({year})" if year else ""
             body += f"*{i}.* {name}{yr}\n   🌐 {lang}\n\n"
             buttons.append([InlineKeyboardButton(
                 f"⬇️ {i}. {name[:33]}{yr}",
                 callback_data=f"subdl_{i}")])
-
         buttons.append([InlineKeyboardButton("🔍 আবার খোঁজো", callback_data="search")])
         buttons.append([InlineKeyboardButton("🔙 হোম",         callback_data="home")])
-
         await msg.edit_text(body, parse_mode='Markdown',
                             reply_markup=InlineKeyboardMarkup(buttons))
         return
@@ -879,7 +911,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown', reply_markup=kb_home())
 
 # ══════════════════════════════════════════════
-# 🚀  MAIN
+# 🚀  MAIN — Conflict fix
 # ══════════════════════════════════════════════
 def main():
     if not BOT_TOKEN:
@@ -898,7 +930,15 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("🤖 Bot polling started!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        # Conflict error ঠেকাতে
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+        pool_timeout=30,
+    )
 
 if __name__ == '__main__':
     main()
