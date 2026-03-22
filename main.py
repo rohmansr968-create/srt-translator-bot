@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-🎬 SRT Subtitle Translator Bot — Final Version
-বাংলা সাবটাইটেল অনুবাদক | Powered by Groq AI
-Features: Translate · Cancel · SubDL Search · AI Chat · Quota Error · Strict Membership
+🎬 SRT Subtitle Translator + 🎙 Audio Transcription Bot
+বাংলা সাবটাইটেল অনুবাদক | Powered by Groq AI + Whisper
+Features: SRT Translate · Cancel · SubDL · AI Chat · Audio Transcription
 Python 3.11 | PTB 20.7
 """
 
-import os, re, io, time, asyncio, logging, threading, functools, requests
+import os, re, io, time, asyncio, logging, threading, functools, requests, tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 import matplotlib
@@ -40,10 +40,16 @@ logger = logging.getLogger(__name__)
 groq_client   = Groq(api_key=GROQ_API_KEY)
 executor      = ThreadPoolExecutor(max_workers=4)
 
-active_tasks  = {}   # {uid: False=running | True=cancelled}
-cancel_events = {}   # {uid: threading.Event}
-chat_mode     = {}   # {uid: bool}
-chat_history  = {}   # {uid: [{role,content}]}
+active_tasks  = {}
+cancel_events = {}
+chat_mode     = {}
+chat_history  = {}
+
+# অডিও ফাইল pending রাখার জন্য
+pending_audio = {}  # {uid: {'file_id': ..., 'file_name': ..., 'duration': ...}}
+
+AUDIO_EXTENSIONS = ('.mp3', '.mp4', '.wav', '.m4a', '.ogg', '.webm', '.oga', '.flac')
+MAX_AUDIO_SIZE   = 25 * 1024 * 1024  # 25MB
 
 # ══════════════════════════════════════════════
 # 🌐  FLASK
@@ -52,7 +58,8 @@ flask_app = Flask(__name__)
 
 @flask_app.route('/')
 def web_home():
-    return """<!DOCTYPE html><html><head><title>SRT Bot</title><meta charset="UTF-8">
+    return """<!DOCTYPE html><html><head><title>SRT + Transcription Bot</title>
+<meta charset="UTF-8">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Segoe UI',sans-serif;
@@ -61,7 +68,7 @@ body{font-family:'Segoe UI',sans-serif;
      align-items:center;min-height:100vh;flex-direction:column;gap:16px}
 .card{background:rgba(255,255,255,.05);border:1px solid rgba(255,137,6,.35);
       border-radius:20px;padding:36px 56px;text-align:center}
-h1{color:#ff8906;font-size:2.6em;margin-bottom:8px}
+h1{color:#ff8906;font-size:2.4em;margin-bottom:8px}
 .dot{width:13px;height:13px;background:#00d4aa;border-radius:50%;
      display:inline-block;animation:p 1.5s infinite;box-shadow:0 0 8px #00d4aa}
 @keyframes p{0%,100%{opacity:1}50%{opacity:.35}}
@@ -71,16 +78,16 @@ p{color:#a7a9be;font-size:1.05em;line-height:1.9}
    padding:5px 14px;border-radius:18px;font-size:.88em;margin:4px}
 </style></head><body>
 <div class="card">
-  <h1>🎬 SRT Translator Bot</h1>
+  <h1>🎬 SRT + 🎙 Transcription Bot</h1>
   <p><span class="dot"></span>&nbsp;
-     <span style="color:#00d4aa;font-weight:700;font-size:1.15em">Bot is Live!</span></p>
-  <p>English Subtitle → সুন্দর বাংলা অনুবাদ</p><br>
+  <span style="color:#00d4aa;font-weight:700;font-size:1.15em">Bot is Live!</span></p>
+  <p>Subtitle Translate · Audio Transcribe · AI Chat</p><br>
   <div>
     <span class="b">🤖 Groq AI</span>
+    <span class="b">🎙 Whisper</span>
     <span class="b">⚡ LLaMA 3.3 70B</span>
-    <span class="b">🔍 SubDL Search</span>
+    <span class="b">🔍 SubDL</span>
     <span class="b">❌ Cancel</span>
-    <span class="b">💬 AI Chat</span>
   </div>
 </div></body></html>""", 200
 
@@ -174,7 +181,7 @@ def generate_pie_chart(completed: int, total: int) -> io.BytesIO:
     return buf
 
 # ══════════════════════════════════════════════
-# 🤖  TRANSLATION
+# 🤖  SUBTITLE TRANSLATION
 # ══════════════════════════════════════════════
 TRANSLATE_SYSTEM = (
     "তুমি একজন পেশাদার চলচ্চিত্র সাবটাইটেল অনুবাদক।\n"
@@ -188,9 +195,8 @@ TRANSLATE_SYSTEM = (
 def _is_quota_error(e: Exception) -> bool:
     err = str(e).lower()
     return any(k in err for k in [
-        'quota', 'limit exceeded', '402',
-        'billing', 'insufficient_quota',
-        'exceeded your current quota'
+        'quota', 'limit exceeded', '402', 'billing',
+        'insufficient_quota', 'exceeded your current quota'
     ])
 
 def _is_rate_limit(e: Exception) -> bool:
@@ -212,12 +218,10 @@ def translate_one_sync(text: str, cancel_event=None) -> str:
                 temperature=0.15, max_tokens=256)
             return r.choices[0].message.content.strip()
         except Exception as e:
-            if _is_quota_error(e):
-                raise Exception("QUOTA_EXCEEDED")
+            if _is_quota_error(e): raise Exception("QUOTA_EXCEEDED")
             elif _is_rate_limit(e):
                 for _ in range(60):
-                    if cancel_event and cancel_event.is_set():
-                        return text
+                    if cancel_event and cancel_event.is_set(): return text
                     time.sleep(1)
             else:
                 time.sleep(3)
@@ -226,7 +230,6 @@ def translate_one_sync(text: str, cancel_event=None) -> str:
 def translate_batch_sync(texts: list, cancel_event=None) -> list:
     if cancel_event and cancel_event.is_set():
         return texts
-
     numbered = '\n'.join(f"[{i+1}] {t}" for i, t in enumerate(texts))
     user_msg = (
         f"নিচের {len(texts)}টি সাবটাইটেল লাইন বাংলায় অনুবাদ করো।\n"
@@ -235,10 +238,8 @@ def translate_batch_sync(texts: list, cancel_event=None) -> list:
         f"{numbered}\n\nBengali:"
     )
     translated = [None] * len(texts)
-
     for attempt in range(3):
-        if cancel_event and cancel_event.is_set():
-            return texts
+        if cancel_event and cancel_event.is_set(): return texts
         try:
             resp = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -254,25 +255,81 @@ def translate_batch_sync(texts: list, cancel_event=None) -> list:
                     translated[idx] = val
             break
         except Exception as e:
-            if _is_quota_error(e):
-                raise Exception("QUOTA_EXCEEDED")
+            if _is_quota_error(e): raise Exception("QUOTA_EXCEEDED")
             elif _is_rate_limit(e):
                 logger.warning(f"Rate limit (attempt {attempt+1}), waiting 60s...")
                 for _ in range(60):
-                    if cancel_event and cancel_event.is_set():
-                        return texts
+                    if cancel_event and cancel_event.is_set(): return texts
                     time.sleep(1)
             else:
-                logger.error(f"Batch error: {e}")
-                time.sleep(5)
+                logger.error(f"Batch error: {e}"); time.sleep(5)
 
     for i, val in enumerate(translated):
         if val is None:
-            if cancel_event and cancel_event.is_set():
-                return texts
+            if cancel_event and cancel_event.is_set(): return texts
             translated[i] = translate_one_sync(texts[i], cancel_event)
-
     return translated
+
+# ══════════════════════════════════════════════
+# 🎙  AUDIO TRANSCRIPTION (Groq Whisper)
+# ══════════════════════════════════════════════
+def transcribe_audio_sync(audio_bytes: bytes, filename: str,
+                          language: str = "en") -> str:
+    """
+    language: 'en' = English, 'bn' = Bengali, 'auto' = auto-detect
+    """
+    try:
+        # temp file তৈরি করো
+        suffix = os.path.splitext(filename)[-1] or '.mp3'
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+
+        try:
+            with open(tmp_path, 'rb') as f:
+                params = dict(
+                    file=(filename, f, 'audio/mpeg'),
+                    model="whisper-large-v3-turbo",
+                    response_format="text",
+                    temperature=0.0,
+                )
+                if language != 'auto':
+                    params['language'] = language
+
+                result = groq_client.audio.transcriptions.create(**params)
+
+            return result.strip() if isinstance(result, str) else result.text.strip()
+
+        finally:
+            os.unlink(tmp_path)
+
+    except Exception as e:
+        if _is_quota_error(e):
+            raise Exception("QUOTA_EXCEEDED")
+        logger.error(f"Transcription error: {e}")
+        raise e
+
+def translate_text_to_bengali_sync(text: str) -> str:
+    """Transcribed text বাংলায় অনুবাদ করো"""
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system",
+                 "content": (
+                     "তুমি একজন পেশাদার অনুবাদক। "
+                     "দেওয়া text স্বাভাবিক কথ্য বাংলায় অনুবাদ করো। "
+                     "ভাব বুঝে অনুবাদ করো, আক্ষরিক নয়। "
+                     "শুধু অনুবাদ দাও, অন্য কিছু লিখবে না।"
+                 )},
+                {"role": "user", "content": f"অনুবাদ করো:\n{text}"}
+            ],
+            temperature=0.15, max_tokens=4096)
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        if _is_quota_error(e):
+            raise Exception("QUOTA_EXCEEDED")
+        raise e
 
 # ══════════════════════════════════════════════
 # 💬  AI CHAT
@@ -302,11 +359,9 @@ def ai_chat_sync(uid: int, user_text: str) -> str:
         return reply
     except Exception as e:
         if _is_quota_error(e):
-            return (
-                "⚠️ *Groq API Limit শেষ!*\n\n"
-                "তোমার API key-এর দৈনিক limit শেষ হয়ে গেছে।\n"
-                "২৪ ঘণ্টা পরে আবার চেষ্টা করো।"
-            )
+            return ("⚠️ *Groq API Limit শেষ!*\n\n"
+                    "তোমার API key-এর দৈনিক limit শেষ হয়ে গেছে।\n"
+                    "২৪ ঘণ্টা পরে আবার চেষ্টা করো।")
         logger.error(f"Chat error: {e}")
         return "❌ সমস্যা হয়েছে, একটু পরে আবার চেষ্টা করো।"
 
@@ -321,8 +376,7 @@ def subdl_search(query: str) -> list:
                     "languages": "EN", "subs_per_page": 8},
             timeout=15)
         if r.status_code != 200:
-            logger.error(f"SubDL {r.status_code}: {r.text[:150]}")
-            return []
+            logger.error(f"SubDL {r.status_code}"); return []
         return r.json().get("subtitles", [])[:8]
     except Exception as e:
         logger.error(f"SubDL search: {e}"); return []
@@ -335,26 +389,14 @@ def subdl_download(url_path: str):
         logger.error(f"SubDL download: {e}"); return None
 
 # ══════════════════════════════════════════════
-# 🔒  CHANNEL MEMBERSHIP — প্রতিটি request-এ চেক হয়
+# 🔒  CHANNEL CHECK
 # ══════════════════════════════════════════════
 async def is_member(uid: int, bot) -> bool:
-    """
-    Telegram API সরাসরি call করে real-time চেক করে।
-    কোনো cache নেই — leave করলে সাথে সাথে access বন্ধ।
-    """
     try:
         m = await bot.get_chat_member(CHANNEL_USERNAME, uid)
         return m.status in ['member', 'administrator', 'creator']
     except Exception as e:
-        logger.warning(f"Member check error: {e}")
-        return False
-
-def kb_not_joined():
-    ch = CHANNEL_USERNAME.lstrip('@')
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 চ্যানেলে যোগ দাও", url=f"https://t.me/{ch}")],
-        [InlineKeyboardButton("✅ যোগ দিয়েছি — চেক করো", callback_data="chk")]
-    ])
+        logger.warning(f"Member check: {e}"); return False
 
 NOT_JOINED_MSG = (
     "🔒 *চ্যানেল Membership নেই!*\n\n"
@@ -362,29 +404,23 @@ NOT_JOINED_MSG = (
     "চ্যানেল থেকে leave নিলে বট access বন্ধ হয়ে যাবে।"
 )
 
-async def check_and_reject(uid: int, bot, reply_func) -> bool:
-    """
-    False মানে member নয় → access block করো
-    True মানে member → চলতে দাও
-    """
-    if not await is_member(uid, bot):
-        await reply_func(
-            NOT_JOINED_MSG,
-            parse_mode='Markdown',
-            reply_markup=kb_not_joined()
-        )
-        return False
-    return True
-
 # ══════════════════════════════════════════════
 # 🎹  KEYBOARDS
 # ══════════════════════════════════════════════
+def kb_not_joined():
+    ch = CHANNEL_USERNAME.lstrip('@')
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 চ্যানেলে যোগ দাও", url=f"https://t.me/{ch}")],
+        [InlineKeyboardButton("✅ যোগ দিয়েছি — চেক করো", callback_data="chk")]
+    ])
+
 def kb_home():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📖 ব্যবহার বিধি",  callback_data="help"),
-         InlineKeyboardButton("ℹ️ বট সম্পর্কে",   callback_data="about")],
-        [InlineKeyboardButton("🔍 Subtitle খোঁজো", callback_data="search"),
-         InlineKeyboardButton("📊 স্ট্যাটাস",       callback_data="status")],
+        [InlineKeyboardButton("📖 ব্যবহার বিধি",        callback_data="help"),
+         InlineKeyboardButton("ℹ️ বট সম্পর্কে",         callback_data="about")],
+        [InlineKeyboardButton("🔍 Subtitle খোঁজো",       callback_data="search"),
+         InlineKeyboardButton("📊 স্ট্যাটাস",             callback_data="status")],
+        [InlineKeyboardButton("🎙 Audio Transcription",  callback_data="audio_info")],
         [InlineKeyboardButton("💬 AI-এর সাথে চ্যাট করো", callback_data="chat_start")]
     ])
 
@@ -395,7 +431,7 @@ def kb_back():
 
 def kb_cancel(uid: int):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ অনুবাদ বাতিল করো", callback_data=f"cancel_{uid}")]
+        [InlineKeyboardButton("❌ বাতিল করো", callback_data=f"cancel_{uid}")]
     ])
 
 def kb_chat():
@@ -415,6 +451,18 @@ def kb_quota_error():
         [InlineKeyboardButton("🔙 হোম", callback_data="home")]
     ])
 
+def kb_audio_options(uid: int):
+    """অডিও পাঠানোর পরে কী করবে জিজ্ঞেস করার keyboard"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🇧🇩 বাংলায় Transcription",
+                              callback_data=f"tr_bn_{uid}")],
+        [InlineKeyboardButton("🇺🇸 English Transcription",
+                              callback_data=f"tr_en_{uid}")],
+        [InlineKeyboardButton("🔄 Transcription + বাংলা অনুবাদ",
+                              callback_data=f"tr_translate_{uid}")],
+        [InlineKeyboardButton("❌ বাতিল", callback_data="home")]
+    ])
+
 # ══════════════════════════════════════════════
 # /start
 # ══════════════════════════════════════════════
@@ -425,47 +473,274 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             NOT_JOINED_MSG, parse_mode='Markdown',
             reply_markup=kb_not_joined())
         return
-
     chat_mode[u.id] = False
     await update.message.reply_text(
-        f"🎬 *SRT সাবটাইটেল অনুবাদক বটে স্বাগতম!*\n\n"
+        f"🎬 *Subtitle BD Bot-এ স্বাগতম!*\n\n"
         f"হ্যালো *{u.first_name}* ভাই! 👋\n\n"
-        f"আমি যা করতে পারি:\n"
-        f"🔄 English `.srt` → সুন্দর বাংলা অনুবাদ\n"
-        f"🔍 মুভির নাম দিয়ে Subtitle খোঁজা ও ডাউনলোড\n"
-        f"❌ যেকোনো সময় অনুবাদ বাতিল করা\n"
+        f"আর কঠিন লাগবে না ভিনদেশি সিনেমা —\n"
+        f"আমি তোমার সাবটাইটেল বাংলায় অনুবাদ করে দেব!\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✨ *আমি যা করতে পারি:*\n\n"
+        f"🔄 `.srt` ফাইল → সুন্দর বাংলা অনুবাদ\n"
+        f"🎙 অডিও/Voice → বাংলা বা English Transcription\n"
+        f"🔍 মুভির Subtitle খোঁজা ও ডাউনলোড\n"
+        f"❌ যেকোনো সময় বাতিল করা\n"
         f"💬 AI-এর সাথে বাংলায় চ্যাট করা\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 অনুবাদ করতে → `.srt` ফাইল পাঠাও\n"
-        f"💬 চ্যাট করতে → নিচের বাটন চাপো\n\n"
-        f"⚡ _Powered by Groq AI (LLaMA 3.3 70B)_",
+        f"📌 সরাসরি `.srt` বা অডিও ফাইল পাঠাও 👇\n\n"
+        f"⚡ _Powered by Groq AI + Whisper_",
         parse_mode='Markdown', reply_markup=kb_home())
 
 # ══════════════════════════════════════════════
-# CALLBACK HANDLER — প্রতিটি button-এ membership চেক
+# 🎙  AUDIO / VOICE HANDLER
+# ══════════════════════════════════════════════
+async def handle_audio_or_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Voice message এবং Audio file দুটোই handle করে"""
+    u = update.effective_user
+
+    if not await is_member(u.id, ctx.bot):
+        await update.message.reply_text(
+            NOT_JOINED_MSG, parse_mode='Markdown',
+            reply_markup=kb_not_joined())
+        return
+
+    msg = update.message
+
+    # Voice message নাকি Audio file তা নির্ধারণ করো
+    if msg.voice:
+        file_obj  = msg.voice
+        file_name = f"voice_{u.id}.ogg"
+        duration  = msg.voice.duration
+        file_size = msg.voice.file_size
+    elif msg.audio:
+        file_obj  = msg.audio
+        file_name = msg.audio.file_name or f"audio_{u.id}.mp3"
+        duration  = msg.audio.duration
+        file_size = msg.audio.file_size
+    else:
+        return
+
+    # Size check
+    if file_size and file_size > MAX_AUDIO_SIZE:
+        await msg.reply_text(
+            "❌ *অডিও ফাইল ২৫MB-এর বেশি!*\n\n"
+            "ছোট ফাইল পাঠাও।",
+            parse_mode='Markdown')
+        return
+
+    # Duration format
+    dur_str = ""
+    if duration:
+        m, s    = divmod(duration, 60)
+        dur_str = f"{m}:{s:02d}"
+
+    # pending-এ সেভ করো
+    pending_audio[u.id] = {
+        'file_id':  file_obj.file_id,
+        'file_name': file_name,
+        'duration': dur_str
+    }
+
+    await msg.reply_text(
+        f"🎙 *অডিও পেয়েছি!*\n\n"
+        f"📁 `{file_name}`\n"
+        f"{'⏱ সময়: ' + dur_str if dur_str else ''}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"এখন কী করতে চাও?",
+        parse_mode='Markdown',
+        reply_markup=kb_audio_options(u.id))
+
+
+async def do_transcription(uid: int, mode: str, bot, chat_id: int,
+                           ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    mode: 'bn' | 'en' | 'translate'
+    """
+    audio_info = pending_audio.get(uid)
+    if not audio_info:
+        await bot.send_message(
+            chat_id,
+            "❌ অডিও ফাইল পাওয়া যায়নি। আবার পাঠাও।")
+        return
+
+    pending_audio.pop(uid, None)
+
+    # Status message
+    mode_text = {
+        'bn':        "🇧🇩 বাংলায় Transcription",
+        'en':        "🇺🇸 English Transcription",
+        'translate': "🔄 Transcription + বাংলা অনুবাদ"
+    }.get(mode, "Transcription")
+
+    status = await bot.send_message(
+        chat_id,
+        f"⏳ *{mode_text} চলছে...*\n\n"
+        f"📁 `{audio_info['file_name']}`\n"
+        f"একটু অপেক্ষা করো...",
+        parse_mode='Markdown')
+
+    try:
+        # অডিও ডাউনলোড
+        f        = await bot.get_file(audio_info['file_id'])
+        raw      = await f.download_as_bytearray()
+        fname    = audio_info['file_name']
+        loop     = asyncio.get_event_loop()
+
+        # Transcription language
+        lang = 'bn' if mode == 'bn' else 'en'
+
+        await bot.edit_message_text(
+            f"🎙 *Transcription শুরু হয়েছে...*\n\n"
+            f"📁 `{fname}`\n"
+            f"🌐 Language: `{lang.upper()}`\n"
+            f"⏳ Whisper AI process করছে...",
+            chat_id=chat_id,
+            message_id=status.message_id,
+            parse_mode='Markdown')
+
+        # Transcribe
+        transcript = await loop.run_in_executor(
+            executor,
+            functools.partial(transcribe_audio_sync, bytes(raw), fname, lang))
+
+        if not transcript or not transcript.strip():
+            await bot.edit_message_text(
+                "❌ *Transcription ব্যর্থ!*\n\n"
+                "অডিওতে কোনো কথা শোনা যায়নি বা\n"
+                "ফাইল format সমস্যা আছে।",
+                chat_id=chat_id,
+                message_id=status.message_id,
+                parse_mode='Markdown',
+                reply_markup=kb_back())
+            return
+
+        # শুধু transcription দরকার হলে পাঠাও
+        if mode in ('bn', 'en'):
+            flag = "🇧🇩" if mode == 'bn' else "🇺🇸"
+            lang_name = "বাংলা" if mode == 'bn' else "English"
+
+            # বড় হলে ফাইল হিসেবে পাঠাও
+            if len(transcript) > 3500:
+                txt_bytes = transcript.encode('utf-8')
+                ext_name  = fname.replace('.ogg', '').replace('.mp3', '')
+                out_fname = f"{ext_name}_{lang_name}_transcript.txt"
+                await bot.edit_message_text(
+                    f"✅ *{flag} {lang_name} Transcription সম্পন্ন!*\n\n"
+                    f"📝 টেক্সট অনেক বড় — ফাইল হিসেবে পাঠাচ্ছি।",
+                    chat_id=chat_id,
+                    message_id=status.message_id,
+                    parse_mode='Markdown')
+                await bot.send_document(
+                    chat_id=chat_id,
+                    document=io.BytesIO(txt_bytes),
+                    filename=out_fname,
+                    caption=f"{flag} *{lang_name} Transcription*\n\n"
+                            f"📁 `{out_fname}`",
+                    parse_mode='Markdown',
+                    reply_markup=kb_home())
+            else:
+                await bot.edit_message_text(
+                    f"✅ *{flag} {lang_name} Transcription সম্পন্ন!*\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"{transcript}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━",
+                    chat_id=chat_id,
+                    message_id=status.message_id,
+                    parse_mode='Markdown',
+                    reply_markup=kb_home())
+
+        # Transcription + বাংলা অনুবাদ
+        elif mode == 'translate':
+            await bot.edit_message_text(
+                f"✅ *English Transcription সম্পন্ন!*\n\n"
+                f"🔄 এখন বাংলায় অনুবাদ করছি...",
+                chat_id=chat_id,
+                message_id=status.message_id,
+                parse_mode='Markdown')
+
+            bengali = await loop.run_in_executor(
+                executor,
+                functools.partial(translate_text_to_bengali_sync, transcript))
+
+            # বড় হলে ফাইল হিসেবে
+            if len(transcript) + len(bengali) > 3000:
+                ext_name  = fname.replace('.ogg', '').replace('.mp3', '')
+                combined  = (
+                    f"=== English Transcription ===\n\n{transcript}\n\n"
+                    f"=== বাংলা অনুবাদ ===\n\n{bengali}"
+                )
+                await bot.edit_message_text(
+                    f"✅ *Transcription + বাংলা অনুবাদ সম্পন্ন!*\n\n"
+                    f"📝 টেক্সট অনেক বড় — ফাইল হিসেবে পাঠাচ্ছি।",
+                    chat_id=chat_id,
+                    message_id=status.message_id,
+                    parse_mode='Markdown')
+                await bot.send_document(
+                    chat_id=chat_id,
+                    document=io.BytesIO(combined.encode('utf-8')),
+                    filename=f"{ext_name}_transcript_bengali.txt",
+                    caption="✅ *Transcription + বাংলা অনুবাদ*",
+                    parse_mode='Markdown',
+                    reply_markup=kb_home())
+            else:
+                await bot.edit_message_text(
+                    f"✅ *Transcription + বাংলা অনুবাদ সম্পন্ন!*\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🇺🇸 *English:*\n{transcript}\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🇧🇩 *বাংলা:*\n{bengali}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━",
+                    chat_id=chat_id,
+                    message_id=status.message_id,
+                    parse_mode='Markdown',
+                    reply_markup=kb_home())
+
+    except Exception as e:
+        err = str(e)
+        logger.error(f"Transcription error for {uid}: {err}")
+
+        if "QUOTA_EXCEEDED" in err:
+            notice = (
+                "⚠️ *Groq API Limit শেষ!*\n\n"
+                "তোমার API key-এর দৈনিক limit শেষ।\n"
+                "২৪ ঘণ্টা পরে আবার চেষ্টা করো।"
+            )
+        else:
+            notice = f"❌ *সমস্যা হয়েছে!*\n\n`{err[:200]}`"
+
+        try:
+            await bot.edit_message_text(
+                notice, chat_id=chat_id,
+                message_id=status.message_id,
+                parse_mode='Markdown',
+                reply_markup=kb_quota_error() if "QUOTA" in err else kb_back())
+        except Exception:
+            pass
+
+# ══════════════════════════════════════════════
+# CALLBACK HANDLER
 # ══════════════════════════════════════════════
 async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     uid = q.from_user.id
     d   = q.data
 
-    # ── "চেক করো" বাটন — membership verify ──
+    # ── Channel check বাটন ──
     if d == "chk":
         await q.answer()
         if await is_member(uid, ctx.bot):
             chat_mode[uid] = False
             await q.edit_message_text(
                 "✅ *দারুণ! চ্যানেলে যোগ দিয়েছ!*\n\n"
-                "`.srt` ফাইল পাঠাও অনুবাদ শুরু করতে 🚀",
+                "`.srt` ফাইল বা অডিও পাঠাও শুরু করতে 🚀",
                 parse_mode='Markdown', reply_markup=kb_home())
         else:
             await q.edit_message_text(
-                "❌ *এখনো যোগ দাওনি!*\n\n"
-                "চ্যানেলে যোগ দাও, তারপর চেক করো।",
+                "❌ *এখনো যোগ দাওনি!*\n\nযোগ দাও, তারপর চেক করো।",
                 parse_mode='Markdown', reply_markup=kb_not_joined())
         return
 
-    # ── Cancel বাটন — membership check দরকার নেই ──
+    # ── Cancel ──
     if d.startswith("cancel_"):
         await q.answer()
         target = int(d.split("_")[1])
@@ -475,24 +750,65 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 cancel_events[uid].set()
             try:
                 await q.edit_message_caption(
-                    caption="❌ *অনুবাদ বাতিল করা হয়েছে!*\n\n"
+                    caption="❌ *বাতিল করা হয়েছে!*\n\n"
                             "নতুন ফাইল পাঠালে আবার শুরু হবে।",
                     parse_mode='Markdown', reply_markup=kb_home())
             except Exception:
                 pass
         else:
-            await q.answer("কোনো সক্রিয় অনুবাদ নেই!", show_alert=True)
+            await q.answer("কোনো সক্রিয় কাজ নেই!", show_alert=True)
+        return
+
+    # ── Audio transcription callbacks ──
+    if d.startswith("tr_"):
+        parts = d.split("_")
+        # tr_bn_UID or tr_en_UID or tr_translate_UID
+        if len(parts) == 3:
+            mode       = parts[1]        # bn / en / translate
+            target_uid = int(parts[2])
+        else:
+            # tr_translate_UID — "translate" has underscore
+            mode       = "translate"
+            target_uid = int(parts[-1])
+
+        if uid != target_uid:
+            await q.answer("এটা তোমার জন্য নয়!", show_alert=True)
+            return
+
+        if not await is_member(uid, ctx.bot):
+            await q.answer("🔒 চ্যানেলে যোগ দাও!", show_alert=True)
+            return
+
+        await q.answer()
+
+        # message edit করে "Processing..." দেখাও
+        mode_text = {
+            'bn':        "🇧🇩 বাংলায় Transcription",
+            'en':        "🇺🇸 English Transcription",
+            'translate': "🔄 Transcription + বাংলা অনুবাদ"
+        }.get(mode, "Transcription")
+
+        try:
+            await q.edit_message_text(
+                f"✅ *{mode_text} শুরু হচ্ছে...*\n\n⏳ একটু অপেক্ষা করো...",
+                parse_mode='Markdown')
+        except Exception:
+            pass
+
+        # Background-এ চালাও
+        asyncio.create_task(
+            do_transcription(uid, mode, ctx.bot,
+                             q.message.chat_id, ctx))
         return
 
     # ══════════════════════════════════════════
-    # ✅ এখান থেকে প্রতিটি callback-এ membership চেক
+    # Membership check — বাকি সব callback-এ
     # ══════════════════════════════════════════
     if not await is_member(uid, ctx.bot):
         await q.answer("🔒 চ্যানেলে যোগ দাও!", show_alert=True)
         try:
             await q.edit_message_text(
-                NOT_JOINED_MSG,
-                parse_mode='Markdown',
+                NOT_JOINED_MSG, parse_mode='Markdown',
                 reply_markup=kb_not_joined())
         except Exception:
             pass
@@ -513,8 +829,7 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         content = await loop.run_in_executor(executor, subdl_download, url_path)
         if not content:
             await q.message.reply_text(
-                "❌ ডাউনলোড হয়নি।\n"
-                "SubDL ফ্রি account-এ দিনে ৫টার বেশি download হয় না।")
+                "❌ ডাউনলোড হয়নি।\nSubDL ফ্রি-তে দিনে ৫টার বেশি হয় না।")
             return
 
         srt_bytes = content
@@ -525,8 +840,7 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     for name in z.namelist():
                         if name.lower().endswith('.srt'):
                             srt_bytes = z.read(name)
-                            fname = os.path.basename(name)
-                            break
+                            fname = os.path.basename(name); break
             except Exception as e:
                 logger.error(f"Zip: {e}")
 
@@ -544,32 +858,45 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Chat callbacks ──
     if d == "chat_start":
         chat_mode[uid] = True
-        if uid not in chat_history:
-            chat_history[uid] = []
+        if uid not in chat_history: chat_history[uid] = []
         await q.edit_message_text(
             "💬 *AI চ্যাট মোড চালু!*\n\n"
-            "এখন যা মনে চায় লেখো — আমি বাংলায় উত্তর দেব। 🤖\n\n"
+            "যা মনে চায় লেখো — আমি বাংলায় উত্তর দেব। 🤖\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
-            "📌 SRT ফাইল পাঠালে অনুবাদ হবে\n"
-            "🗑 কথোপকথন মুছতে নিচের বাটন\n"
-            "🔙 চ্যাট বন্ধ করতে নিচের বাটন",
+            "📌 SRT/অডিও ফাইল পাঠালে তা কাজ করবে\n"
+            "🗑 কথোপকথন মুছতে নিচের বাটন",
             parse_mode='Markdown', reply_markup=kb_chat())
         return
 
     if d == "chat_clear":
         chat_history[uid] = []
         await q.edit_message_text(
-            "🗑 *কথোপকথন মুছে ফেলা হয়েছে!*\n\n"
-            "নতুনভাবে শুরু করো 😊",
+            "🗑 *কথোপকথন মুছে ফেলা হয়েছে!*\n\nনতুনভাবে শুরু করো 😊",
             parse_mode='Markdown', reply_markup=kb_chat())
         return
 
     if d == "chat_stop":
         chat_mode[uid] = False
         await q.edit_message_text(
-            "✅ *চ্যাট মোড বন্ধ হয়েছে।*\n\n"
-            "আবার শুরু করতে 💬 বাটন চাপো।",
+            "✅ *চ্যাট মোড বন্ধ।*\n\nআবার শুরু করতে 💬 চাপো।",
             parse_mode='Markdown', reply_markup=kb_home())
+        return
+
+    if d == "audio_info":
+        await q.edit_message_text(
+            "🎙 *Audio Transcription*\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "যেকোনো অডিও বা Voice message পাঠাও,\n"
+            "তারপর বেছে নাও কী করতে চাও:\n\n"
+            "🇧🇩 বাংলায় Transcription\n"
+            "🇺🇸 English Transcription\n"
+            "🔄 Transcription + বাংলা অনুবাদ\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "📁 *সাপোর্টেড ফরম্যাট:*\n"
+            "`mp3, mp4, wav, m4a, ogg, webm, flac`\n\n"
+            "⚠️ *সর্বোচ্চ সাইজ:* 25MB\n"
+            "⚡ *Powered by:* Groq Whisper AI",
+            parse_mode='Markdown', reply_markup=kb_back())
         return
 
     # ── Standard buttons ──
@@ -577,22 +904,23 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             "📖 *ব্যবহার বিধি*\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
-            "*🔄 অনুবাদ করতে:*\n"
-            "1️⃣ যেকোনো `.srt` ফাইল পাঠাও\n"
+            "*🔄 SRT অনুবাদ:*\n"
+            "1️⃣ `.srt` ফাইল পাঠাও\n"
             "2️⃣ Live chart-এ progress দেখো\n"
-            "3️⃣ মাঝে বন্ধ করতে ❌ Cancel চাপো\n"
-            "4️⃣ অনুবাদিত `.srt` ফাইল পাবে\n\n"
+            "3️⃣ ❌ Cancel বাটনে বাতিল করো\n"
+            "4️⃣ অনুবাদিত ফাইল পাবে\n\n"
+            "*🎙 Audio Transcription:*\n"
+            "1️⃣ Voice message বা অডিও ফাইল পাঠাও\n"
+            "2️⃣ বাংলা/English/অনুবাদ — যেটা চাও বেছে নাও\n"
+            "3️⃣ ফলাফল পাবে\n\n"
             "*🔍 Subtitle খুঁজতে:*\n"
             "1️⃣ 🔍 বাটন চাপো\n"
             "2️⃣ মুভির নাম লেখো (English)\n"
-            "3️⃣ ⬇️ বাটনে ডাউনলোড করো\n"
-            "4️⃣ ফাইল পাঠিয়ে বাংলায় অনুবাদ করাও!\n\n"
+            "3️⃣ ⬇️ বাটনে ডাউনলোড করো\n\n"
             "*💬 AI চ্যাট:*\n"
-            "1️⃣ 💬 বাটন চাপো\n"
-            "2️⃣ যা মনে চায় লেখো\n"
-            "3️⃣ AI বাংলায় উত্তর দেবে\n\n"
+            "1️⃣ 💬 বাটন চাপো → লেখো → উত্তর পাও\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
-            "⚠️ Max size: 5MB | Format: `.srt`",
+            "⚠️ SRT max: 5MB | Audio max: 25MB",
             parse_mode='Markdown', reply_markup=kb_back())
 
     elif d == "about":
@@ -600,17 +928,16 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "ℹ️ *বট পরিচিতি*\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
             "🤖 *AI:* LLaMA 3.3 70B (Groq)\n"
+            "🎙 *Transcription:* Whisper Large v3\n"
             "🌐 *Hosting:* Render Free\n"
-            "📚 *Subtitle DB:* SubDL.com\n"
-            "⚡ *Speed:* Ultra-fast\n\n"
+            "📚 *Subtitle DB:* SubDL.com\n\n"
             "✨ *বিশেষত্ব:*\n"
             "• ভাবানুবাদ — আক্ষরিক নয়\n"
-            "• প্রতিটি লাইন নিশ্চিত অনুবাদ\n"
-            "• Timing সম্পূর্ণ নির্ভুল\n"
+            "• Audio → বাংলা/English Transcription\n"
+            "• Telegram Voice message সাপোর্ট\n"
+            "• প্রতিটি SRT লাইন নিশ্চিত অনুবাদ\n"
             "• তাৎক্ষণিক Cancel সাপোর্ট\n"
-            "• Subtitle খোঁজা ও ডাউনলোড\n"
-            "• বাংলায় AI চ্যাট\n"
-            "• চ্যানেল leave করলে সাথে সাথে access বন্ধ",
+            "• চ্যানেল leave করলে সাথে সাথে block",
             parse_mode='Markdown', reply_markup=kb_back())
 
     elif d == "status":
@@ -621,6 +948,7 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━━━━━\n"
             "🟢 *Bot:* Online\n"
             "🟢 *Groq AI:* Connected\n"
+            "🟢 *Whisper:* Ready\n"
             "🟢 *Flask:* Running\n"
             "🔄 *Self-ping:* Active (14 min)\n"
             f"⚙️ *চলমান অনুবাদ:* {running}\n"
@@ -632,15 +960,14 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not SUBDL_API_KEY:
             await q.edit_message_text(
                 "❌ *Subtitle Search চালু নেই!*\n\n"
-                "Render-এ `SUBDL_API_KEY` set করো।\n"
-                "subdl.com থেকে ফ্রি API key নাও।",
+                "Render-এ `SUBDL_API_KEY` set করো।",
                 parse_mode='Markdown', reply_markup=kb_back())
             return
         ctx.user_data['awaiting_search'] = True
         await q.edit_message_text(
             "🔍 *Subtitle খোঁজো*\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
-            "মুভি বা সিরিজের নাম *English-এ* লেখো:\n\n"
+            "মুভির নাম *English-এ* লেখো:\n\n"
             "📌 `Pirates of the Caribbean`\n"
             "📌 `Breaking Bad S01E01`\n"
             "📌 `Me Before You 2016`",
@@ -650,8 +977,8 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat_mode[uid] = False
         ctx.user_data['awaiting_search'] = False
         await q.edit_message_text(
-            "🎬 *SRT সাবটাইটেল অনুবাদক বট*\n\n"
-            "`.srt` ফাইল পাঠাও অনুবাদ করতে\n"
+            "🎬 *SRT Subtitle BD Bot*\n\n"
+            "`.srt` ফাইল বা অডিও পাঠাও\n"
             "অথবা নিচের বাটন ব্যবহার করো! 🚀",
             parse_mode='Markdown', reply_markup=kb_home())
 
@@ -662,28 +989,58 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u   = update.effective_user
     doc = update.message.document
 
-    # ── Real-time membership check ──
     if not await is_member(u.id, ctx.bot):
         await update.message.reply_text(
             NOT_JOINED_MSG, parse_mode='Markdown',
             reply_markup=kb_not_joined())
         return
 
-    if not doc.file_name.lower().endswith('.srt'):
+    fname = doc.file_name.lower()
+
+    # অডিও ফাইল হলে audio handler-এ পাঠাও
+    if any(fname.endswith(ext) for ext in AUDIO_EXTENSIONS):
+        # document হিসেবে আসা audio ফাইল handle করো
+        file_size = doc.file_size
+        if file_size and file_size > MAX_AUDIO_SIZE:
+            await update.message.reply_text(
+                "❌ *অডিও ফাইল ২৫MB-এর বেশি!*",
+                parse_mode='Markdown')
+            return
+
+        pending_audio[u.id] = {
+            'file_id':   doc.file_id,
+            'file_name': doc.file_name,
+            'duration':  ''
+        }
         await update.message.reply_text(
-            "❌ *শুধুমাত্র `.srt` ফাইল পাঠাও!*",
-            parse_mode='Markdown'); return
+            f"🎙 *অডিও ফাইল পেয়েছি!*\n\n"
+            f"📁 `{doc.file_name}`\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"এখন কী করতে চাও?",
+            parse_mode='Markdown',
+            reply_markup=kb_audio_options(u.id))
+        return
+
+    # SRT ফাইল
+    if not fname.endswith('.srt'):
+        await update.message.reply_text(
+            "❌ *শুধুমাত্র `.srt` বা অডিও ফাইল পাঠাও!*\n\n"
+            "সাপোর্টেড অডিও: `mp3, mp4, wav, m4a, ogg, webm`",
+            parse_mode='Markdown')
+        return
 
     if doc.file_size and doc.file_size > 5 * 1024 * 1024:
         await update.message.reply_text(
-            "❌ *ফাইল সাইজ ৫MB-এর বেশি!*",
-            parse_mode='Markdown'); return
+            "❌ *SRT ফাইল সাইজ ৫MB-এর বেশি!*",
+            parse_mode='Markdown')
+        return
 
     if u.id in active_tasks and not active_tasks[u.id]:
         await update.message.reply_text(
             "⚠️ *একটি অনুবাদ ইতিমধ্যে চলছে!*\n\n"
             "আগেরটা শেষ করো বা Cancel করো।",
-            parse_mode='Markdown'); return
+            parse_mode='Markdown')
+        return
 
     chat_mode[u.id]     = False
     active_tasks[u.id]  = False
@@ -710,16 +1067,17 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not srt_text:
             await status.edit_caption(
                 "❌ ফাইল পড়তে পারছি না! UTF-8 দিয়ে সেভ করো.",
-                parse_mode='Markdown'); return
+                parse_mode='Markdown')
+            return
 
         blocks = parse_srt(srt_text)
         if not blocks:
             await status.edit_caption(
                 "❌ SRT ফাইলে কোনো সাবটাইটেল নেই!",
-                parse_mode='Markdown'); return
+                parse_mode='Markdown')
+            return
 
         total = len(blocks)
-
         await status.edit_media(InputMediaPhoto(
             media=generate_pie_chart(0, total),
             caption=(f"🎬 *অনুবাদ শুরু হচ্ছে...*\n\n"
@@ -736,25 +1094,20 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         for i in range(0, total, BATCH):
             if c_event.is_set() or active_tasks.get(u.id, False):
-                logger.info(f"Cancelled: {u.id}"); return
-
+                return
             chunk  = blocks[i:i + BATCH]
             texts  = [b['text'] for b in chunk]
             result = await loop.run_in_executor(
                 executor,
                 functools.partial(translate_batch_sync, texts, c_event))
-
             if c_event.is_set() or active_tasks.get(u.id, False):
-                logger.info(f"Cancelled after batch: {u.id}"); return
-
+                return
             for j, tr in enumerate(result):
                 if i + j < total:
                     translated[i + j]['text'] = tr
-
             completed = min(i + BATCH, total)
             pct  = completed / total * 100
             bar  = '█' * int(pct / 5) + '░' * (20 - int(pct / 5))
-
             try:
                 await status.edit_media(InputMediaPhoto(
                     media=generate_pie_chart(completed, total),
@@ -768,7 +1121,6 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     reply_markup=kb_cancel(u.id))
             except Exception as e:
                 logger.warning(f"Edit ignored: {e}")
-
             await asyncio.sleep(0.4)
 
         if c_event.is_set() or active_tasks.get(u.id, False):
@@ -801,10 +1153,9 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         err_msg = str(e)
         logger.error(f"Error {u.id}: {err_msg}")
-
         if "QUOTA_EXCEEDED" in err_msg:
             notice = (
-                "⚠️ *Groq API Limit শেষ হয়ে গেছে!*\n\n"
+                "⚠️ *Groq API Limit শেষ!*\n\n"
                 "তোমার API key-এর দৈনিক limit শেষ।\n\n"
                 "🔧 *সমাধান:*\n"
                 "1️⃣ [console.groq.com](https://console.groq.com) যাও\n"
@@ -839,17 +1190,16 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u    = update.effective_user
     text = update.message.text.strip()
 
-    # ── Real-time membership check ──
     if not await is_member(u.id, ctx.bot):
         await update.message.reply_text(
             NOT_JOINED_MSG, parse_mode='Markdown',
             reply_markup=kb_not_joined())
         return
 
-    # ── Search mode ──
+    # Search mode
     if ctx.user_data.get('awaiting_search'):
         ctx.user_data['awaiting_search'] = False
-        msg  = await update.message.reply_text(
+        msg     = await update.message.reply_text(
             f"🔍 *খোঁজা হচ্ছে:* `{text}`\n\n⏳ একটু অপেক্ষা করো...",
             parse_mode='Markdown')
         loop    = asyncio.get_event_loop()
@@ -879,15 +1229,14 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             yr    = f" ({year})" if year else ""
             body += f"*{i}.* {name}{yr}\n   🌐 {lang}\n\n"
             buttons.append([InlineKeyboardButton(
-                f"⬇️ {i}. {name[:33]}{yr}",
-                callback_data=f"subdl_{i}")])
+                f"⬇️ {i}. {name[:33]}{yr}", callback_data=f"subdl_{i}")])
         buttons.append([InlineKeyboardButton("🔍 আবার খোঁজো", callback_data="search")])
         buttons.append([InlineKeyboardButton("🔙 হোম",         callback_data="home")])
         await msg.edit_text(body, parse_mode='Markdown',
                             reply_markup=InlineKeyboardMarkup(buttons))
         return
 
-    # ── AI Chat mode ──
+    # AI Chat mode
     if chat_mode.get(u.id, False):
         await ctx.bot.send_chat_action(
             chat_id=update.effective_chat.id, action="typing")
@@ -902,16 +1251,17 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown', reply_markup=kb_chat())
         return
 
-    # ── Default ──
+    # Default
     await update.message.reply_text(
         "📌 *কী করতে চাও?*\n\n"
-        "• অনুবাদ করতে → `.srt` ফাইল পাঠাও\n"
+        "• SRT অনুবাদ → `.srt` ফাইল পাঠাও\n"
+        "• Transcription → 🎙 অডিও/Voice পাঠাও\n"
         "• Subtitle খুঁজতে → 🔍 বাটন চাপো\n"
-        "• AI-এর সাথে কথা বলতে → 💬 বাটন চাপো",
+        "• AI চ্যাট → 💬 বাটন চাপো",
         parse_mode='Markdown', reply_markup=kb_home())
 
 # ══════════════════════════════════════════════
-# 🚀  MAIN — Conflict fix
+# 🚀  MAIN
 # ══════════════════════════════════════════════
 def main():
     if not BOT_TOKEN:
@@ -926,14 +1276,20 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(cb_handler))
+
+    # Voice message
+    app.add_handler(MessageHandler(filters.VOICE, handle_audio_or_voice))
+    # Audio file
+    app.add_handler(MessageHandler(filters.AUDIO, handle_audio_or_voice))
+    # Document (SRT + audio as document)
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+    # Text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("🤖 Bot polling started!")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
-        # Conflict error ঠেকাতে
         read_timeout=30,
         write_timeout=30,
         connect_timeout=30,
