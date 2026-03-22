@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 🎬 SRT Subtitle Translator — Ultra Version
-বাংলা সাবটাইটেল অনুবাদক | Powered by Groq AI + Whisper
+Powered by Groq AI + Whisper + Cobalt
 Python 3.11 | PTB 20.7
 """
 
@@ -16,10 +16,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 from flask import Flask
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputMediaPhoto, InputMediaDocument
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, ContextTypes
@@ -40,7 +37,7 @@ GROQ_API_KEY     = os.environ.get('GROQ_API_KEY', '')
 CHANNEL_USERNAME = os.environ.get('CHANNEL_USERNAME', '@your_channel')
 RENDER_URL       = os.environ.get('RENDER_URL', '')
 SUBDL_API_KEY    = os.environ.get('SUBDL_API_KEY', '')
-OMDB_API_KEY     = os.environ.get('OMDB_API_KEY', '')   # omdbapi.com free key
+OMDB_API_KEY     = os.environ.get('OMDB_API_KEY', '')
 ADMIN_IDS_STR    = os.environ.get('ADMIN_IDS', '')
 
 ADMIN_IDS = set()
@@ -48,27 +45,24 @@ for _a in ADMIN_IDS_STR.split(','):
     try: ADMIN_IDS.add(int(_a.strip()))
     except: pass
 
-# ── Token Config ──
-WELCOME_TOKENS   = 50
-DAILY_TOKENS     = 10
-REF_REFERRER     = 25
-REF_REFEREE      = 15
-PREMIUM_THRESH   = 100
+WELCOME_TOKENS = 50
+DAILY_TOKENS   = 10
+REF_REFERRER   = 25
+REF_REFEREE    = 15
+PREMIUM_THRESH = 100
 
-# ── Token Costs per action ──
 COST = {
-    'srt_per_500lines': 2,   # প্রতি ৫০০ লাইনে ২ token
+    'srt_per_500lines': 2,
     'youtube':          8,
     'audio_transcribe': 5,
     'audio_translate':  8,
     'chat_per_msg':     1,
 }
 
-# ── Promo Codes ──
 PROMO_CODES = {
     'PREMIUMBOT': {'tokens': 50, 'desc': '🎁 Premium Welcome Pack'},
-    'SUBTITLE50':  {'tokens': 50, 'desc': '🎬 Subtitle Special'},
-    'FREEBONUS':   {'tokens': 30, 'desc': '🆓 Free Bonus'},
+    'SUBTITLE50': {'tokens': 50, 'desc': '🎬 Subtitle Special'},
+    'FREEBONUS':  {'tokens': 30, 'desc': '🆓 Free Bonus'},
 }
 
 SRC_LANGS = {
@@ -77,10 +71,16 @@ SRC_LANGS = {
     'fr':'🇫🇷 French','de':'🇩🇪 German','zh':'🇨🇳 Chinese',
     'es':'🇪🇸 Spanish','ru':'🇷🇺 Russian',
 }
-DST_LANGS = {'bn':'🇧🇩 বাংলা','en':'🇺🇸 English','hi':'🇮🇳 Hindi'}
-AUDIO_EXTS = ('.mp3','.mp4','.wav','.m4a','.ogg','.webm','.oga','.flac')
-MAX_AUDIO  = 25*1024*1024
-DB_PATH    = '/tmp/subtitle_bot.db'
+DST_LANGS   = {'bn':'🇧🇩 বাংলা','en':'🇺🇸 English','hi':'🇮🇳 Hindi'}
+AUDIO_EXTS  = ('.mp3','.mp4','.wav','.m4a','.ogg','.webm','.oga','.flac')
+MAX_AUDIO   = 25*1024*1024
+DB_PATH     = '/tmp/subtitle_bot.db'
+
+COBALT_INSTANCES = [
+    "https://api.cobalt.tools",
+    "https://cobalt.api.timelessnesses.me",
+    "https://cobalt.yt",
+]
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -93,7 +93,6 @@ chat_mode     = {}
 chat_history  = {}
 pending_audio = {}
 user_state    = {}
-used_promos   = {}   # {uid: set(codes)}
 
 # ══════════════════════════════════════════════
 # 🗄️  DATABASE
@@ -128,6 +127,7 @@ def init_db():
     con.commit(); con.close()
     logger.info("✅ DB ready")
 
+def _now(): return datetime.now().isoformat()
 def _rcode(uid): return "R"+hashlib.md5(f"sub{uid}bd".encode()).hexdigest()[:7].upper()
 
 def get_user(uid, username=None, first_name=None, ref_code=None):
@@ -142,35 +142,28 @@ def get_user(uid, username=None, first_name=None, ref_code=None):
             if r and r['uid'] != uid:
                 referred_by = r['uid']
                 tokens += REF_REFEREE
-                con.execute("UPDATE users SET tokens=tokens+? WHERE uid=?",
-                            (REF_REFERRER, referred_by))
-                con.execute("INSERT INTO referrals VALUES(NULL,?,?,?)",
-                            (referred_by, uid, _now()))
-        con.execute('''INSERT INTO users
-            (uid,username,first_name,tokens,join_date,referral_code,referred_by)
-            VALUES(?,?,?,?,?,?,?)''',
+                con.execute("UPDATE users SET tokens=tokens+? WHERE uid=?", (REF_REFERRER, referred_by))
+                con.execute("INSERT INTO referrals VALUES(NULL,?,?,?)", (referred_by, uid, _now()))
+        con.execute(
+            'INSERT INTO users (uid,username,first_name,tokens,join_date,referral_code,referred_by) VALUES(?,?,?,?,?,?,?)',
             (uid,username,first_name,tokens,_now(),_rcode(uid),referred_by))
         con.commit()
         c.execute("SELECT * FROM users WHERE uid=?", (uid,))
         u = c.fetchone()
     else:
-        con.execute("UPDATE users SET username=?,first_name=? WHERE uid=?",
-                    (username,first_name,uid)); con.commit()
+        con.execute("UPDATE users SET username=?,first_name=? WHERE uid=?", (username,first_name,uid))
+        con.commit()
     result = dict(u); con.close(); return result
-
-def _now(): return datetime.now().isoformat()
 
 def add_tokens(uid, n):
     con = db(); con.execute("UPDATE users SET tokens=tokens+? WHERE uid=?", (n,uid))
     con.commit(); con.close()
 
 def deduct_tokens(uid, n) -> bool:
-    """Deduct tokens. Returns True if sufficient."""
     con = db(); c = con.cursor()
     c.execute("SELECT tokens FROM users WHERE uid=?", (uid,))
     row = c.fetchone()
-    if not row or row['tokens'] < n:
-        con.close(); return False
+    if not row or row['tokens'] < n: con.close(); return False
     con.execute("UPDATE users SET tokens=tokens-? WHERE uid=?", (n,uid))
     con.commit(); con.close(); return True
 
@@ -190,23 +183,18 @@ def claim_daily(uid):
         if diff < timedelta(hours=24):
             left = int((timedelta(hours=24)-diff).total_seconds()/3600)
             con.close(); return False, left
-    con.execute("UPDATE users SET tokens=tokens+?,last_daily=? WHERE uid=?",
-                (DAILY_TOKENS,_now(),uid))
+    con.execute("UPDATE users SET tokens=tokens+?,last_daily=? WHERE uid=?", (DAILY_TOKENS,_now(),uid))
     con.commit(); con.close(); return True, 0
 
-def use_promo(uid, code) -> tuple:
-    """(success, message)"""
+def use_promo(uid, code):
     code = code.upper().strip()
-    if code not in PROMO_CODES:
-        return False, "❌ কোড সঠিক নয়!"
+    if code not in PROMO_CODES: return False, "❌ কোড সঠিক নয়!"
     con = db(); c = con.cursor()
     c.execute("SELECT used_promos FROM users WHERE uid=?", (uid,))
     row = c.fetchone()
     used = set((row['used_promos'] or '').split(',')) if row else set()
-    if code in used:
-        con.close(); return False, "❌ এই code আগেই ব্যবহার করেছ!"
-    promo = PROMO_CODES[code]
-    used.add(code)
+    if code in used: con.close(); return False, "❌ এই code আগেই ব্যবহার করেছ!"
+    promo = PROMO_CODES[code]; used.add(code)
     con.execute("UPDATE users SET tokens=tokens+?,used_promos=? WHERE uid=?",
                 (promo['tokens'],','.join(filter(None,used)),uid))
     con.commit(); con.close()
@@ -214,10 +202,8 @@ def use_promo(uid, code) -> tuple:
 
 def log_history(uid, fname, lines, fl, tl, cost):
     con = db()
-    con.execute("INSERT INTO history VALUES(NULL,?,?,?,?,?,?,?)",
-                (uid,fname,lines,fl,tl,cost,_now()))
-    con.execute("UPDATE users SET total_translations=total_translations+1,"
-                "total_lines=total_lines+? WHERE uid=?", (lines,uid))
+    con.execute("INSERT INTO history VALUES(NULL,?,?,?,?,?,?,?)", (uid,fname,lines,fl,tl,cost,_now()))
+    con.execute("UPDATE users SET total_translations=total_translations+1,total_lines=total_lines+? WHERE uid=?", (lines,uid))
     con.commit(); con.close()
 
 def get_history(uid, limit=5):
@@ -239,7 +225,7 @@ def all_uids():
     ids = [r['uid'] for r in c.fetchall()]; con.close(); return ids
 
 def ban_user(uid, banned):
-    con = db(); con.execute("UPDATE users SET is_banned=? WHERE uid=?",(1 if banned else 0,uid))
+    con = db(); con.execute("UPDATE users SET is_banned=? WHERE uid=?", (1 if banned else 0,uid))
     con.commit(); con.close()
 
 def is_banned(uid):
@@ -249,18 +235,17 @@ def is_banned(uid):
 
 def set_lang(uid, from_lang=None, to_lang=None):
     con = db()
-    if from_lang: con.execute("UPDATE users SET from_lang=? WHERE uid=?",(from_lang,uid))
-    if to_lang:   con.execute("UPDATE users SET to_lang=? WHERE uid=?",  (to_lang,uid))
+    if from_lang: con.execute("UPDATE users SET from_lang=? WHERE uid=?", (from_lang,uid))
+    if to_lang:   con.execute("UPDATE users SET to_lang=? WHERE uid=?",   (to_lang,uid))
     con.commit(); con.close()
 
 def ref_count(uid):
     con = db(); c = con.cursor()
-    c.execute("SELECT COUNT(*) t FROM referrals WHERE referrer=?",(uid,))
+    c.execute("SELECT COUNT(*) t FROM referrals WHERE referrer=?", (uid,))
     n = c.fetchone()['t']; con.close(); return n
 
 def calc_srt_cost(lines: int) -> int:
-    """SRT token cost based on line count"""
-    if lines <= 500: return 0          # ৫০০ লাইন পর্যন্ত ফ্রি
+    if lines <= 500: return 0
     return max(1, (lines // 500) * COST['srt_per_500lines'])
 
 # ══════════════════════════════════════════════
@@ -289,11 +274,10 @@ p{color:#a7a9be;font-size:1em;line-height:1.9}
 <div class="card">
   <h1>🎬 SRT Ultra Bot</h1>
   <p><span class="dot"></span>&nbsp;<span style="color:#00d4aa;font-weight:700">Bot is Live!</span></p>
-  <p>Multi-lang · YouTube · Tokens · Referral · Admin</p><br>
+  <p>Subtitle · YouTube DL · Tokens · Admin</p><br>
   <div>
     <span class="b">🤖 Groq AI</span><span class="b">🎙 Whisper</span>
-    <span class="b">🌐 Multi-lang</span><span class="b">▶️ YouTube</span>
-    <span class="b">🪙 Tokens</span><span class="b">👑 Admin</span>
+    <span class="b">📥 Cobalt DL</span><span class="b">🪙 Tokens</span>
   </div>
 </div></body></html>""", 200
 
@@ -322,8 +306,7 @@ def parse_srt(content):
     for m in pat.finditer(content.strip()+'\n\n'):
         txt = m.group(4).strip()
         if txt:
-            blocks.append({'index':m.group(1),'start':m.group(2),
-                           'end':m.group(3),'text':txt})
+            blocks.append({'index':m.group(1),'start':m.group(2),'end':m.group(3),'text':txt})
     return blocks
 
 def parse_vtt(content):
@@ -347,7 +330,9 @@ def parse_vtt(content):
 
 def parse_ass(content):
     blocks, idx = [], 1
-    pat = re.compile(r'^Dialogue:.*?(\d:\d{2}:\d{2}\.\d{2}),(\d:\d{2}:\d{2}\.\d{2}),[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,(.*)', re.MULTILINE)
+    pat = re.compile(
+        r'^Dialogue:.*?(\d:\d{2}:\d{2}\.\d{2}),(\d:\d{2}:\d{2}\.\d{2}),[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,(.*)',
+        re.MULTILINE)
     def at(t):
         p = t.split(':'); h=p[0].zfill(2); m=p[1].zfill(2)
         s,ms = p[2].replace('.',',').split(',')
@@ -365,7 +350,9 @@ def parse_auto(content, filename):
     return parse_srt(content)
 
 def build_srt(blocks):
-    return '\n\n'.join(f"{b['index']}\n{b['start']} --> {b['end']}\n{b['text']}" for b in blocks)+'\n'
+    return '\n\n'.join(
+        f"{b['index']}\n{b['start']} --> {b['end']}\n{b['text']}"
+        for b in blocks) + '\n'
 
 def fix_timing(blocks, offset_sec):
     def shift(ts):
@@ -396,10 +383,10 @@ def pie_chart(done, total):
     else:
         sizes=[done,rem]; colors=['#00d4aa','#2d2d44']
         labels=[f'Done ({done})',f'Left ({rem})']
-    explode=([0.05,0] if len(sizes)==2 else [0])
-    _,_,ats=ax.pie(sizes,explode=explode,colors=colors,autopct='%1.1f%%',
-                   startangle=90,pctdistance=0.65,
-                   wedgeprops={'linewidth':2.5,'edgecolor':'#0f0e17'},shadow=True)
+    explode = ([0.05,0] if len(sizes)==2 else [0])
+    _,_,ats = ax.pie(sizes,explode=explode,colors=colors,autopct='%1.1f%%',
+                     startangle=90,pctdistance=0.65,
+                     wedgeprops={'linewidth':2.5,'edgecolor':'#0f0e17'},shadow=True)
     for at in ats: at.set_color('white'); at.set_fontsize(13); at.set_fontweight('bold')
     ax.text(0,0,f'{pct:.1f}%',ha='center',va='center',fontsize=26,fontweight='bold',color='white')
     patches=[mpatches.Patch(color=colors[i],label=labels[i]) for i in range(len(labels))]
@@ -417,7 +404,7 @@ def pie_chart(done, total):
 def _iq(e): return any(k in str(e).lower() for k in ['quota','limit exceeded','402','billing'])
 def _ir(e): return 'rate_limit' in str(e).lower() or '429' in str(e)
 
-def _tsys(fl,tl):
+def _tsys(fl, tl):
     src = SRC_LANGS.get(fl,fl) if fl!='auto' else 'any language'
     dst = DST_LANGS.get(tl,tl)
     return (f"You are a professional subtitle translator.\n"
@@ -430,11 +417,11 @@ def t1(text, fl='auto', tl='bn', ce=None):
     for _ in range(3):
         if ce and ce.is_set(): return text
         try:
-            r=groq_client.chat.completions.create(
+            r = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role":"system","content":_tsys(fl,tl)},
                           {"role":"user","content":f"Translate:\n{text}"}],
-                temperature=0.15,max_tokens=256)
+                temperature=0.15, max_tokens=256)
             return r.choices[0].message.content.strip()
         except Exception as e:
             if _iq(e): raise Exception("QUOTA_EXCEEDED")
@@ -450,16 +437,16 @@ def tbatch(texts, fl='auto', tl='bn', ce=None):
     numbered = '\n'.join(f"[{i+1}] {t}" for i,t in enumerate(texts))
     msg = (f"Translate the following {len(texts)} subtitle lines.\n"
            f"Keep number prefix [1],[2]...\nReturn ONLY translations.\n\n{numbered}\n\nTranslation:")
-    translated=[None]*len(texts)
+    translated = [None]*len(texts)
     for att in range(3):
         if ce and ce.is_set(): return texts
         try:
-            resp=groq_client.chat.completions.create(
+            resp = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role":"system","content":_tsys(fl,tl)},
                           {"role":"user","content":msg}],
-                temperature=0.15,max_tokens=3000)
-            raw=resp.choices[0].message.content.strip()
+                temperature=0.15, max_tokens=3000)
+            raw = resp.choices[0].message.content.strip()
             for m in re.finditer(r'\[(\d+)\]\s*(.*?)(?=\[\d+\]|\Z)',raw,re.DOTALL):
                 idx=int(m.group(1))-1; val=m.group(2).strip()
                 if 0<=idx<len(texts) and val: translated[idx]=val
@@ -474,7 +461,7 @@ def tbatch(texts, fl='auto', tl='bn', ce=None):
     for i,v in enumerate(translated):
         if v is None:
             if ce and ce.is_set(): return texts
-            translated[i]=t1(texts[i],fl,tl,ce)
+            translated[i] = t1(texts[i],fl,tl,ce)
     return translated
 
 # ══════════════════════════════════════════════
@@ -482,15 +469,15 @@ def tbatch(texts, fl='auto', tl='bn', ce=None):
 # ══════════════════════════════════════════════
 def transcribe(audio_bytes, filename, language='en'):
     suffix = os.path.splitext(filename)[-1] or '.mp3'
-    with tempfile.NamedTemporaryFile(suffix=suffix,delete=False) as tmp:
-        tmp.write(audio_bytes); tmp_path=tmp.name
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(audio_bytes); tmp_path = tmp.name
     try:
         with open(tmp_path,'rb') as f:
-            params=dict(file=(filename,f,'audio/mpeg'),
-                        model="whisper-large-v3-turbo",
-                        response_format="text",temperature=0.0)
-            if language!='auto': params['language']=language
-            r=groq_client.audio.transcriptions.create(**params)
+            params = dict(file=(filename,f,'audio/mpeg'),
+                          model="whisper-large-v3-turbo",
+                          response_format="text", temperature=0.0)
+            if language != 'auto': params['language'] = language
+            r = groq_client.audio.transcriptions.create(**params)
         return r.strip() if isinstance(r,str) else r.text.strip()
     except Exception as e:
         if _iq(e): raise Exception("QUOTA_EXCEEDED")
@@ -499,75 +486,62 @@ def transcribe(audio_bytes, filename, language='en'):
 
 def trans_plain(text, tl='bn'):
     try:
-        resp=groq_client.chat.completions.create(
+        resp = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role":"system","content":(
                     f"You are a professional translator. "
-                    f"Translate to {DST_LANGS.get(tl,'Bengali')} naturally. Return ONLY translation.")},
+                    f"Translate to {DST_LANGS.get(tl,'Bengali')} naturally. "
+                    f"Return ONLY the translation.")},
                 {"role":"user","content":f"Translate:\n{text}"}],
-            temperature=0.15,max_tokens=4096)
+            temperature=0.15, max_tokens=4096)
         return resp.choices[0].message.content.strip()
     except Exception as e:
         if _iq(e): raise Exception("QUOTA_EXCEEDED")
         raise e
 
 # ══════════════════════════════════════════════
-# 🎬  MOVIE INFO (OMDB + Spell Fix)
+# 📥  COBALT — YouTube Video/Audio Download
 # ══════════════════════════════════════════════
-def fix_movie_name(query: str) -> str:
-    """Groq দিয়ে মুভির নাম spell check করো"""
-    try:
-        resp = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role":"system","content":(
-                    "You are a movie title spell checker. "
-                    "Given a possibly misspelled movie title, return the correct movie title. "
-                    "Return ONLY the corrected title, nothing else. "
-                    "If it's already correct, return it as-is.")},
-                {"role":"user","content":f"Correct this movie title: {query}"}],
-            temperature=0.1, max_tokens=50)
-        return resp.choices[0].message.content.strip()
-    except:
-        return query
-
-def get_movie_info(title: str) -> dict:
-    """OMDB থেকে movie info + poster নাও"""
-    if not OMDB_API_KEY:
-        return {}
-    try:
-        r = requests.get("http://www.omdbapi.com/",
-                         params={'apikey':OMDB_API_KEY,'t':title,'type':'movie'},
-                         timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if data.get('Response') == 'True':
-                return data
-        # Try TV series if movie not found
-        r2 = requests.get("http://www.omdbapi.com/",
-                          params={'apikey':OMDB_API_KEY,'t':title,'type':'series'},
-                          timeout=10)
-        if r2.status_code == 200:
-            data2 = r2.json()
-            if data2.get('Response') == 'True':
-                return data2
-    except: pass
+def cobalt_get_link(yt_url: str, quality: str = "1080") -> dict:
+    """Cobalt API দিয়ে YouTube video direct download link নাও"""
+    headers = {"Accept":"application/json","Content-Type":"application/json"}
+    payload = {"url":yt_url,"videoQuality":quality,"filenameStyle":"pretty","downloadMode":"auto"}
+    for instance in COBALT_INSTANCES:
+        try:
+            r = requests.post(f"{instance}/", json=payload, headers=headers, timeout=15)
+            if r.status_code == 200:
+                data = r.json(); status = data.get("status","")
+                if status in ("tunnel","redirect"):
+                    return {"url":data.get("url",""),"filename":data.get("filename","video.mp4"),"type":"video"}
+                elif status == "picker":
+                    items = data.get("picker",[])
+                    if items:
+                        return {"url":items[0].get("url",""),"filename":data.get("filename","video.mp4"),
+                                "type":"video","picker":items}
+                elif status == "error":
+                    logger.warning(f"Cobalt {instance}: {data.get('error','')}")
+        except Exception as e:
+            logger.warning(f"Cobalt {instance}: {e}")
     return {}
 
-def download_poster(url: str):
-    """Poster image download করো"""
-    if not url or url == 'N/A':
-        return None
-    try:
-        r = requests.get(url, timeout=10)
-        if r.status_code == 200:
-            return r.content
-    except: pass
-    return None
+def cobalt_get_audio(yt_url: str) -> dict:
+    """Cobalt API দিয়ে MP3 download link নাও"""
+    headers = {"Accept":"application/json","Content-Type":"application/json"}
+    payload = {"url":yt_url,"downloadMode":"audio","audioFormat":"mp3","filenameStyle":"pretty"}
+    for instance in COBALT_INSTANCES:
+        try:
+            r = requests.post(f"{instance}/", json=payload, headers=headers, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("status") in ("tunnel","redirect"):
+                    return {"url":data.get("url",""),"filename":data.get("filename","audio.mp3"),"type":"audio"}
+        except Exception as e:
+            logger.warning(f"Cobalt audio {instance}: {e}")
+    return {}
 
 # ══════════════════════════════════════════════
-# ▶️  YOUTUBE
+# ▶️  YOUTUBE SUBTITLE
 # ══════════════════════════════════════════════
 def yt_subtitle(url, lang='en'):
     if not YT_AVAILABLE: return None, None
@@ -584,43 +558,85 @@ def yt_subtitle(url, lang='en'):
                 if f.endswith(('.srt','.vtt')):
                     with open(os.path.join(tmpdir,f),'r',encoding='utf-8',errors='ignore') as sf:
                         return sf.read(), title
-        except Exception as e: logger.error(f"YT: {e}")
+        except Exception as e: logger.error(f"YT subtitle: {e}")
     return None, None
+
+# ══════════════════════════════════════════════
+# 🎬  MOVIE INFO (OMDB + Spell Fix)
+# ══════════════════════════════════════════════
+def fix_movie_name(query: str) -> str:
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role":"system","content":(
+                    "You are a movie title spell checker. "
+                    "Given a possibly misspelled movie title, return the correct movie title. "
+                    "Return ONLY the corrected title, nothing else.")},
+                {"role":"user","content":f"Correct this movie title: {query}"}],
+            temperature=0.1, max_tokens=50)
+        return resp.choices[0].message.content.strip()
+    except: return query
+
+def get_movie_info(title: str) -> dict:
+    if not OMDB_API_KEY: return {}
+    try:
+        r = requests.get("http://www.omdbapi.com/",
+                         params={'apikey':OMDB_API_KEY,'t':title,'type':'movie'}, timeout=10)
+        if r.status_code==200:
+            data = r.json()
+            if data.get('Response')=='True': return data
+        r2 = requests.get("http://www.omdbapi.com/",
+                          params={'apikey':OMDB_API_KEY,'t':title,'type':'series'}, timeout=10)
+        if r2.status_code==200:
+            data2 = r2.json()
+            if data2.get('Response')=='True': return data2
+    except: pass
+    return {}
+
+def download_poster(url: str):
+    if not url or url=='N/A': return None
+    try:
+        r = requests.get(url, timeout=10)
+        if r.status_code==200: return r.content
+    except: pass
+    return None
 
 # ══════════════════════════════════════════════
 # 🔍  SUBDL
 # ══════════════════════════════════════════════
 def subdl_search(query):
     try:
-        r=requests.get("https://api.subdl.com/api/v1/subtitles",
-                       params={"api_key":SUBDL_API_KEY,"film_name":query,
-                               "languages":"EN","subs_per_page":8},timeout=15)
+        r = requests.get("https://api.subdl.com/api/v1/subtitles",
+                         params={"api_key":SUBDL_API_KEY,"film_name":query,
+                                 "languages":"EN","subs_per_page":8}, timeout=15)
         if r.status_code!=200: return []
         return r.json().get("subtitles",[])[:8]
     except: return []
 
 def subdl_dl(url_path):
     try:
-        r=requests.get(f"https://dl.subdl.com{url_path}",timeout=30)
+        r = requests.get(f"https://dl.subdl.com{url_path}", timeout=30)
         return r.content if r.status_code==200 else None
     except: return None
 
 # ══════════════════════════════════════════════
 # 💬  AI CHAT
 # ══════════════════════════════════════════════
-CHAT_SYS="তুমি একটি বন্ধুত্বপূর্ণ AI assistant। বাংলায় কথা বলো। স্বাভাবিক ভাষায় উত্তর দাও।"
+CHAT_SYS = "তুমি একটি বন্ধুত্বপূর্ণ AI assistant। বাংলায় কথা বলো। স্বাভাবিক ভাষায় উত্তর দাও।"
 
 def ai_chat(uid, text):
     if uid not in chat_history: chat_history[uid]=[]
     chat_history[uid].append({"role":"user","content":text})
     if len(chat_history[uid])>20: chat_history[uid]=chat_history[uid][-20:]
     try:
-        resp=groq_client.chat.completions.create(
+        resp = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role":"system","content":CHAT_SYS}]+chat_history[uid],
-            temperature=0.7,max_tokens=1024)
-        reply=resp.choices[0].message.content.strip()
-        chat_history[uid].append({"role":"assistant","content":reply}); return reply
+            temperature=0.7, max_tokens=1024)
+        reply = resp.choices[0].message.content.strip()
+        chat_history[uid].append({"role":"assistant","content":reply})
+        return reply
     except Exception as e:
         if _iq(e): return "⚠️ API limit শেষ।"
         return "❌ সমস্যা হয়েছে।"
@@ -630,15 +646,17 @@ def ai_chat(uid, text):
 # ══════════════════════════════════════════════
 async def is_member(uid, bot):
     try:
-        m=await bot.get_chat_member(CHANNEL_USERNAME,uid)
+        m = await bot.get_chat_member(CHANNEL_USERNAME, uid)
         return m.status in ['member','administrator','creator']
     except: return False
 
-NOT_JOINED="🔒 *চ্যানেল Membership নেই!*\n\nবট ব্যবহার করতে চ্যানেলে যোগ দাও।\nLeave নিলে সাথে সাথে access বন্ধ।"
-BANNED="🚫 *তোমাকে ban করা হয়েছে।*"
-QUOTA_MSG=("⚠️ *Groq API Limit শেষ!*\n\n"
-           "2৪ ঘণ্টা পরে চেষ্টা করো অথবা নতুন key দাও।\n"
-           "[console.groq.com](https://console.groq.com)")
+NOT_JOINED = ("🔒 *চ্যানেল Membership নেই!*\n\n"
+              "বট ব্যবহার করতে চ্যানেলে যোগ দাও।\n"
+              "Leave নিলে সাথে সাথে access বন্ধ।")
+BANNED    = "🚫 *তোমাকে ban করা হয়েছে।*"
+QUOTA_MSG = ("⚠️ *Groq API Limit শেষ!*\n\n"
+             "২৪ ঘণ্টা পরে চেষ্টা করো।\n"
+             "[console.groq.com](https://console.groq.com)")
 
 async def check_access(uid, bot, reply_fn) -> bool:
     if is_banned(uid):
@@ -647,13 +665,12 @@ async def check_access(uid, bot, reply_fn) -> bool:
         ch = CHANNEL_USERNAME.lstrip('@')
         await reply_fn(NOT_JOINED, parse_mode='Markdown',
                        reply_markup=InlineKeyboardMarkup([
-                           [InlineKeyboardButton("📢 চ্যানেলে যোগ দাও",url=f"https://t.me/{ch}")],
-                           [InlineKeyboardButton("✅ চেক করো",callback_data="chk")]]))
+                           [InlineKeyboardButton("📢 চ্যানেলে যোগ দাও", url=f"https://t.me/{ch}")],
+                           [InlineKeyboardButton("✅ চেক করো", callback_data="chk")]]))
         return False
     return True
 
 def token_warn(cost, balance) -> str:
-    """Token insufficient message"""
     return (f"🪙 *Token কম!*\n\n"
             f"এই কাজে লাগবে: *{cost} tokens*\n"
             f"তোমার আছে: *{balance} tokens*\n\n"
@@ -661,63 +678,93 @@ def token_warn(cost, balance) -> str:
             f"💡 *Token পেতে:*\n"
             f"• `/daily` — প্রতিদিন {DAILY_TOKENS} tokens\n"
             f"• `/referral` — বন্ধু আনো, {REF_REFERRER} tokens পাও\n"
-            f"• `/promo` — promo code ব্যবহার করো")
+            f"• `/promo PREMIUMBOT` — 50 tokens ফ্রি!")
+
+def token_info_text():
+    return (f"🪙 *Token খরচের তালিকা*\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📁 *SRT/VTT/ASS অনুবাদ:*\n"
+            f"   ≤500 লাইন → বিনামূল্যে 🆓\n"
+            f"   প্রতি ৫০০ লাইনে → {COST['srt_per_500lines']} tokens\n\n"
+            f"▶️ *YouTube Subtitle:* {COST['youtube']} tokens\n"
+            f"📥 *YouTube Download:* ফ্রি 🆓\n"
+            f"🎙 *Audio Transcription:* {COST['audio_transcribe']} tokens\n"
+            f"🔄 *Audio + অনুবাদ:* {COST['audio_translate']} tokens\n"
+            f"💬 *AI Chat:* {COST['chat_per_msg']} token/message\n"
+            f"🛠 *Tools (Timing/Merge):* ফ্রি 🆓\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎁 *Token পাওয়ার উপায়:*\n"
+            f"• Welcome: *{WELCOME_TOKENS}* | Daily: *{DAILY_TOKENS}*\n"
+            f"• Referral: *{REF_REFERRER}* | Promo: `/promo PREMIUMBOT`")
 
 # ══════════════════════════════════════════════
 # 🎹  KEYBOARDS
 # ══════════════════════════════════════════════
 def kb_not_joined():
-    ch=CHANNEL_USERNAME.lstrip('@')
+    ch = CHANNEL_USERNAME.lstrip('@')
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 চ্যানেলে যোগ দাও",url=f"https://t.me/{ch}")],
-        [InlineKeyboardButton("✅ যোগ দিয়েছি — চেক করো",callback_data="chk")]])
+        [InlineKeyboardButton("📢 চ্যানেলে যোগ দাও", url=f"https://t.me/{ch}")],
+        [InlineKeyboardButton("✅ যোগ দিয়েছি — চেক করো", callback_data="chk")]])
 
 def kb_home():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📖 ব্যবহার বিধি",callback_data="help"),
-         InlineKeyboardButton("👤 প্রোফাইল",   callback_data="profile")],
-        [InlineKeyboardButton("🌐 ভাষা সেটিং", callback_data="lang_menu"),
-         InlineKeyboardButton("🪙 Token দেখো", callback_data="token_info")],
-        [InlineKeyboardButton("🔍 Subtitle খোঁজো",callback_data="search"),
-         InlineKeyboardButton("▶️ YouTube",      callback_data="yt_info")],
-        [InlineKeyboardButton("🛠 Subtitle Tools",callback_data="tools_menu")],
-        [InlineKeyboardButton("🎙 Audio Transcription",callback_data="audio_info")],
-        [InlineKeyboardButton("💬 AI চ্যাট",    callback_data="chat_start"),
-         InlineKeyboardButton("🎁 Daily Token", callback_data="daily")]])
+        [InlineKeyboardButton("📖 ব্যবহার বিধি",  callback_data="help"),
+         InlineKeyboardButton("👤 প্রোফাইল",       callback_data="profile")],
+        [InlineKeyboardButton("🌐 ভাষা সেটিং",     callback_data="lang_menu"),
+         InlineKeyboardButton("🪙 Token দেখো",     callback_data="token_info")],
+        [InlineKeyboardButton("🔍 Subtitle খোঁজো", callback_data="search"),
+         InlineKeyboardButton("▶️ YT Subtitle",    callback_data="yt_info")],
+        [InlineKeyboardButton("📥 YouTube ডাউনলোড 🆓", callback_data="yt_download")],
+        [InlineKeyboardButton("🛠 Subtitle Tools",  callback_data="tools_menu")],
+        [InlineKeyboardButton("🎙 Audio Transcription", callback_data="audio_info")],
+        [InlineKeyboardButton("💬 AI চ্যাট",        callback_data="chat_start"),
+         InlineKeyboardButton("🎁 Daily Token",     callback_data="daily")]])
 
-def kb_back(): return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 হোম",callback_data="home")]])
-def kb_cancel(uid): return InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল করো",callback_data=f"cancel_{uid}")]])
+def kb_back():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 হোম", callback_data="home")]])
+
+def kb_cancel(uid):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল করো", callback_data=f"cancel_{uid}")]])
+
 def kb_chat():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🗑 মুছো",callback_data="chat_clear")],
-        [InlineKeyboardButton("🔙 বন্ধ",callback_data="chat_stop")]])
+        [InlineKeyboardButton("🗑 মুছো",  callback_data="chat_clear")],
+        [InlineKeyboardButton("🔙 বন্ধ", callback_data="chat_stop")]])
+
 def kb_quota():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔑 Groq Console",url="https://console.groq.com")],
-        [InlineKeyboardButton("🔙 হোম",callback_data="home")]])
+        [InlineKeyboardButton("🔑 Groq Console", url="https://console.groq.com")],
+        [InlineKeyboardButton("🔙 হোম", callback_data="home")]])
+
 def kb_audio(uid):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🇧🇩 বাংলায় ({COST['audio_transcribe']}🪙)",callback_data=f"tr_bn_{uid}")],
-        [InlineKeyboardButton(f"🇺🇸 English ({COST['audio_transcribe']}🪙)",callback_data=f"tr_en_{uid}")],
-        [InlineKeyboardButton(f"🔄 + অনুবাদ ({COST['audio_translate']}🪙)",callback_data=f"tr_translate_{uid}")],
-        [InlineKeyboardButton("❌ বাতিল",callback_data="home")]])
+        [InlineKeyboardButton(f"🇧🇩 বাংলায় ({COST['audio_transcribe']}🪙)",  callback_data=f"tr_bn_{uid}")],
+        [InlineKeyboardButton(f"🇺🇸 English ({COST['audio_transcribe']}🪙)",  callback_data=f"tr_en_{uid}")],
+        [InlineKeyboardButton(f"🔄 + অনুবাদ ({COST['audio_translate']}🪙)",  callback_data=f"tr_translate_{uid}")],
+        [InlineKeyboardButton("❌ বাতিল", callback_data="home")]])
+
 def kb_src_lang():
-    rows=[]
-    items=list(SRC_LANGS.items())
-    for i in range(0,len(items),2):
-        row=[InlineKeyboardButton(name,callback_data=f"set_src_{code}") for code,name in items[i:i+2]]
+    rows = []
+    items = list(SRC_LANGS.items())
+    for i in range(0, len(items), 2):
+        row = [InlineKeyboardButton(name, callback_data=f"set_src_{code}")
+               for code,name in items[i:i+2]]
         rows.append(row)
-    rows.append([InlineKeyboardButton("🔙 হোম",callback_data="home")])
+    rows.append([InlineKeyboardButton("🔙 হোম", callback_data="home")])
     return InlineKeyboardMarkup(rows)
+
 def kb_dst_lang():
-    rows=[[InlineKeyboardButton(name,callback_data=f"set_dst_{code}")] for code,name in DST_LANGS.items()]
-    rows.append([InlineKeyboardButton("🔙 হোম",callback_data="home")])
+    rows = [[InlineKeyboardButton(name, callback_data=f"set_dst_{code}")]
+            for code,name in DST_LANGS.items()]
+    rows.append([InlineKeyboardButton("🔙 হোম", callback_data="home")])
     return InlineKeyboardMarkup(rows)
+
 def kb_tools():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏱ Timing Fix",callback_data="tool_timing")],
-        [InlineKeyboardButton("🔀 Merge",    callback_data="tool_merge")],
-        [InlineKeyboardButton("🔙 হোম",      callback_data="home")]])
+        [InlineKeyboardButton("⏱ Timing Fix", callback_data="tool_timing")],
+        [InlineKeyboardButton("🔀 Merge",     callback_data="tool_merge")],
+        [InlineKeyboardButton("🔙 হোম",        callback_data="home")]])
+
 def kb_admin():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Statistics",  callback_data="adm_stats"),
@@ -728,61 +775,51 @@ def kb_admin():
          InlineKeyboardButton("✅ Unban",        callback_data="adm_unban")],
         [InlineKeyboardButton("🔙 হোম",          callback_data="home")]])
 
-def token_info_text():
-    return (f"🪙 *Token খরচের তালিকা*\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📁 *SRT/VTT/ASS অনুবাদ:*\n"
-            f"   ≤500 লাইন → বিনামূল্যে 🆓\n"
-            f"   প্রতি ৫০০ লাইনে → {COST['srt_per_500lines']} tokens\n\n"
-            f"▶️ *YouTube Subtitle:* {COST['youtube']} tokens\n"
-            f"🎙 *Audio Transcription:* {COST['audio_transcribe']} tokens\n"
-            f"🔄 *Audio + অনুবাদ:* {COST['audio_translate']} tokens\n"
-            f"💬 *AI Chat:* {COST['chat_per_msg']} token/message\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎁 *Token পাওয়ার উপায়:*\n"
-            f"• Welcome bonus: *{WELCOME_TOKENS}* tokens\n"
-            f"• Daily: *{DAILY_TOKENS}* tokens\n"
-            f"• Referral: *{REF_REFERRER}* tokens\n"
-            f"• Promo code: `/promo CODE`")
+def kb_yt_choice(url: str):
+    """YouTube link দিলে কী করবে জিজ্ঞেস করার keyboard"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"▶️ Subtitle অনুবাদ ({COST['youtube']}🪙)", callback_data="yt_info")],
+        [InlineKeyboardButton("📥 Video ডাউনলোড 🆓",  callback_data="yt_download")],
+        [InlineKeyboardButton("🎵 MP3 ডাউনলোড 🆓",    callback_data="yt_dl_audio")]])
 
 # ══════════════════════════════════════════════
 # /start
 # ══════════════════════════════════════════════
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u=update.effective_user; args=ctx.args or []
-    ref=args[0] if args else None
+    u = update.effective_user; args = ctx.args or []
+    ref = args[0] if args else None
     if not await check_access(u.id, ctx.bot, update.message.reply_text): return
-    user=get_user(u.id,u.username,u.first_name,ref)
-    chat_mode[u.id]=False
-    is_new=(datetime.fromisoformat(user['join_date']).date()==datetime.now().date()
-            and user['total_translations']==0)
-    badge="👑" if user['tokens']>=PREMIUM_THRESH else "🆓"
-    extra=""
+    user = get_user(u.id, u.username, u.first_name, ref)
+    chat_mode[u.id] = False
+    is_new = (datetime.fromisoformat(user['join_date']).date()==datetime.now().date()
+              and user['total_translations']==0)
+    badge  = "👑" if user['tokens']>=PREMIUM_THRESH else "🆓"
+    extra  = ""
     if is_new:
-        extra=f"\n\n🎁 *Welcome!* তোমার account-এ *{WELCOME_TOKENS} tokens* যোগ হয়েছে!"
+        extra = f"\n\n🎁 *Welcome!* তোমার account-এ *{WELCOME_TOKENS} tokens* যোগ হয়েছে!"
         if user['referred_by']:
-            extra+=f"\n🤝 Referral bonus: আরো *{REF_REFEREE} tokens*!"
+            extra += f"\n🤝 Referral bonus: আরো *{REF_REFEREE} tokens*!"
     await update.message.reply_text(
         f"🎬 *Subtitle BD Bot-এ স্বাগতম!* {badge}\n\n"
         f"হ্যালো *{u.first_name}* ভাই! 👋{extra}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"🪙 Token: *{user['tokens']}* | 🎖 {badge}\n\n"
-        f"📌 ফাইল পাঠাও বা বাটন চাপো 👇",
+        f"📌 ফাইল বা YouTube link পাঠাও 👇",
         parse_mode='Markdown', reply_markup=kb_home())
 
 # ══════════════════════════════════════════════
-# /profile
+# COMMANDS
 # ══════════════════════════════════════════════
 async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u=update.effective_user
-    if not await check_access(u.id,ctx.bot,update.message.reply_text): return
-    user=get_user(u.id); hist=get_history(u.id,5); refs=ref_count(u.id)
-    badge="👑 Premium" if user['tokens']>=PREMIUM_THRESH else "🆓 Free"
-    ht=""
+    u = update.effective_user
+    if not await check_access(u.id, ctx.bot, update.message.reply_text): return
+    user = get_user(u.id); hist = get_history(u.id,5); refs = ref_count(u.id)
+    badge = "👑 Premium" if user['tokens']>=PREMIUM_THRESH else "🆓 Free"
+    ht = ""
     if hist:
-        ht="\n\n📋 *শেষ ৫টি অনুবাদ:*\n"
+        ht = "\n\n📋 *শেষ ৫টি অনুবাদ:*\n"
         for h in hist:
-            ht+=f"• `{h['file_name'][:22]}` {h['line_count']}লাইন (-{h['cost']}🪙) `{h['ts'][:10]}`\n"
+            ht += f"• `{h['file_name'][:22]}` {h['line_count']}লাইন (-{h['cost']}🪙) `{h['ts'][:10]}`\n"
     await update.message.reply_text(
         f"👤 *প্রোফাইল*\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
@@ -794,37 +831,29 @@ async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{ht}",
         parse_mode='Markdown', reply_markup=kb_back())
 
-# ══════════════════════════════════════════════
-# /referral
-# ══════════════════════════════════════════════
 async def cmd_referral(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u=update.effective_user
-    if not await check_access(u.id,ctx.bot,update.message.reply_text): return
-    user=get_user(u.id); refs=ref_count(u.id)
-    bi=await ctx.bot.get_me()
-    link=f"https://t.me/{bi.username}?start={user['referral_code']}"
+    u = update.effective_user
+    if not await check_access(u.id, ctx.bot, update.message.reply_text): return
+    user = get_user(u.id); refs = ref_count(u.id)
+    bi = await ctx.bot.get_me()
+    link = f"https://t.me/{bi.username}?start={user['referral_code']}"
     await update.message.reply_text(
         f"🤝 *Referral System*\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"তোমার Referral Link:\n`{link}`\n\n"
         f"📌 *কীভাবে কাজ করে:*\n"
         f"1️⃣ তুমি link শেয়ার করো\n"
-        f"2️⃣ বন্ধু link-এ ক্লিক করে বট open করে\n"
-        f"3️⃣ Telegram বটকে তোমার code পাঠায় (auto)\n"
-        f"4️⃣ বট code দেখে তোমাকে identify করে\n"
-        f"5️⃣ তুমি পাও: *{REF_REFERRER} tokens* 🎁\n"
+        f"2️⃣ বন্ধু link-এ click করে বট open করে\n"
+        f"3️⃣ Telegram bot-কে auto `{user['referral_code']}` পাঠায়\n"
+        f"4️⃣ তুমি পাও: *{REF_REFERRER} tokens* 🎁\n"
         f"   বন্ধু পায়: *{WELCOME_TOKENS+REF_REFEREE} tokens* 🎁\n\n"
         f"📊 এখন পর্যন্ত: *{refs} জন* | উপার্জন: *{refs*REF_REFERRER} tokens*",
         parse_mode='Markdown', reply_markup=kb_back())
 
-# ══════════════════════════════════════════════
-# /daily
-# ══════════════════════════════════════════════
 async def cmd_daily(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u=update.effective_user
-    if not await check_access(u.id,ctx.bot,update.message.reply_text): return
-    ok,h=claim_daily(u.id)
-    bal=get_tokens(u.id)
+    u = update.effective_user
+    if not await check_access(u.id, ctx.bot, update.message.reply_text): return
+    ok, h = claim_daily(u.id); bal = get_tokens(u.id)
     if ok:
         await update.message.reply_text(
             f"🎁 *+{DAILY_TOKENS} tokens পেয়েছ!*\n\n💰 Balance: *{bal} tokens*",
@@ -834,33 +863,24 @@ async def cmd_daily(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"⏰ *{h} ঘণ্টা পরে আবার নাও।*\n💰 Balance: *{bal} tokens*",
             parse_mode='Markdown', reply_markup=kb_home())
 
-# ══════════════════════════════════════════════
-# /promo
-# ══════════════════════════════════════════════
 async def cmd_promo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u=update.effective_user
-    if not await check_access(u.id,ctx.bot,update.message.reply_text): return
-    args=ctx.args or []
+    u = update.effective_user
+    if not await check_access(u.id, ctx.bot, update.message.reply_text): return
+    args = ctx.args or []
     if not args:
         await update.message.reply_text(
-            "🎁 *Promo Code*\n\n"
-            "ব্যবহার: `/promo CODE`\n\n"
-            "উদাহরণ: `/promo PREMIUMBOT`",
-            parse_mode='Markdown')
-        return
-    ok,msg=use_promo(u.id,args[0])
-    bal=get_tokens(u.id)
+            "🎁 *Promo Code*\n\nব্যবহার: `/promo CODE`\nউদাহরণ: `/promo PREMIUMBOT`",
+            parse_mode='Markdown'); return
+    ok, msg = use_promo(u.id, args[0])
+    bal = get_tokens(u.id)
     await update.message.reply_text(
         f"{msg}\n\n💰 Balance: *{bal} tokens*",
         parse_mode='Markdown', reply_markup=kb_home())
 
-# ══════════════════════════════════════════════
-# /admin
-# ══════════════════════════════════════════════
 async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("❌ তুমি admin নও।"); return
-    s=get_stats()
+    s = get_stats()
     await update.message.reply_text(
         f"👑 *Admin Panel*\n\n"
         f"👥 Users: `{s['users']}` | ✅ Active: `{s['active']}`\n"
@@ -868,687 +888,849 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown', reply_markup=kb_admin())
 
 # ══════════════════════════════════════════════
+# 🎙  TRANSCRIPTION TASK
+# ══════════════════════════════════════════════
+async def do_transcription(uid, mode, bot, chat_id):
+    info = pending_audio.get(uid)
+    if not info:
+        await bot.send_message(chat_id, "❌ অডিও নেই। আবার পাঠাও।"); return
+    pending_audio.pop(uid, None)
+    cost = COST['audio_translate'] if mode=='translate' else COST['audio_transcribe']
+    if not deduct_tokens(uid, cost):
+        bal = get_tokens(uid)
+        await bot.send_message(chat_id, token_warn(cost,bal), parse_mode='Markdown',
+                               reply_markup=kb_back()); return
+    status = await bot.send_message(chat_id, "⏳ *Transcription চলছে...*", parse_mode='Markdown')
+    try:
+        f   = await bot.get_file(info['file_id'])
+        raw = await f.download_as_bytearray()
+        loop = asyncio.get_event_loop()
+        lang = 'bn' if mode=='bn' else 'en'
+        tr = await loop.run_in_executor(executor,
+             functools.partial(transcribe, bytes(raw), info['file_name'], lang))
+        if not tr or not tr.strip():
+            await bot.edit_message_text("❌ কথা পাওয়া যায়নি!", chat_id=chat_id,
+                message_id=status.message_id, reply_markup=kb_back())
+            add_tokens(uid, cost); return
+        bal = get_tokens(uid)
+        if mode in ('bn','en'):
+            flag = "🇧🇩" if mode=='bn' else "🇺🇸"
+            text = f"✅ *{flag} Transcription সম্পন্ন!*\n🪙 -{cost} | Balance: *{bal}*\n\n━━━━━━━━\n{tr}\n━━━━━━━━"
+            if len(text)>4096:
+                await bot.edit_message_text("✅ সম্পন্ন! ফাইল পাঠাচ্ছি...",
+                    chat_id=chat_id, message_id=status.message_id)
+                await bot.send_document(chat_id, document=io.BytesIO(tr.encode()),
+                    filename="transcript.txt", reply_markup=kb_home())
+            else:
+                await bot.edit_message_text(text, chat_id=chat_id,
+                    message_id=status.message_id, parse_mode='Markdown', reply_markup=kb_home())
+        else:
+            await bot.edit_message_text("🔄 অনুবাদ করছি...",
+                chat_id=chat_id, message_id=status.message_id)
+            user = get_user(uid)
+            bn = await loop.run_in_executor(executor,
+                 functools.partial(trans_plain, tr, user['to_lang']))
+            combined = f"🇺🇸 *English:*\n{tr}\n\n🇧🇩 *Translation:*\n{bn}"
+            if len(combined)>4096:
+                full = f"=== English ===\n{tr}\n\n=== Translation ===\n{bn}"
+                await bot.edit_message_text("✅ সম্পন্ন!",
+                    chat_id=chat_id, message_id=status.message_id)
+                await bot.send_document(chat_id, document=io.BytesIO(full.encode()),
+                    filename="transcript_translated.txt", reply_markup=kb_home())
+            else:
+                await bot.edit_message_text(
+                    f"✅ *সম্পন্ন!* 🪙 -{cost} | Balance: *{bal}*\n\n{combined}",
+                    chat_id=chat_id, message_id=status.message_id,
+                    parse_mode='Markdown', reply_markup=kb_home())
+    except Exception as e:
+        err = str(e); add_tokens(uid, cost)
+        notice = QUOTA_MSG if "QUOTA_EXCEEDED" in err else f"❌ সমস্যা: `{err[:150]}`"
+        try:
+            await bot.edit_message_text(notice, chat_id=chat_id,
+                message_id=status.message_id, parse_mode='Markdown',
+                reply_markup=kb_quota() if "QUOTA" in err else kb_back())
+        except: pass
+
+# ══════════════════════════════════════════════
 # CALLBACK HANDLER
 # ══════════════════════════════════════════════
 async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query; uid=q.from_user.id; d=q.data
+    q   = update.callback_query
+    uid = q.from_user.id
+    d   = q.data
 
     # ── No-auth ──
-    if d=="chk":
+    if d == "chk":
         await q.answer()
-        if await is_member(uid,ctx.bot):
-            get_user(uid,q.from_user.username,q.from_user.first_name)
+        if await is_member(uid, ctx.bot):
+            get_user(uid, q.from_user.username, q.from_user.first_name)
             await q.edit_message_text("✅ *যোগ দিয়েছ!* শুরু করো 🚀",
-                                      parse_mode='Markdown',reply_markup=kb_home())
+                                      parse_mode='Markdown', reply_markup=kb_home())
         else:
-            await q.edit_message_text(NOT_JOINED,parse_mode='Markdown',reply_markup=kb_not_joined())
+            await q.edit_message_text(NOT_JOINED, parse_mode='Markdown',
+                                      reply_markup=kb_not_joined())
         return
 
     if d.startswith("cancel_"):
         await q.answer()
-        target=int(d.split("_")[1])
+        target = int(d.split("_")[1])
         if uid==target and uid in active_tasks:
-            active_tasks[uid]=True
+            active_tasks[uid] = True
             if uid in cancel_events: cancel_events[uid].set()
             try:
                 await q.edit_message_caption(
                     caption="❌ *বাতিল!* নতুন ফাইল পাঠাও।",
-                    parse_mode='Markdown',reply_markup=kb_home())
+                    parse_mode='Markdown', reply_markup=kb_home())
             except: pass
-        else: await q.answer("কোনো সক্রিয় কাজ নেই!",show_alert=True)
+        else: await q.answer("কোনো সক্রিয় কাজ নেই!", show_alert=True)
         return
 
-    # ── Audio callbacks ──
+    # ── Audio ──
     if d.startswith("tr_"):
-        if is_banned(uid): await q.answer(BANNED,show_alert=True); return
-        parts=d.split("_"); mode=parts[1]; target=int(parts[-1])
-        if uid!=target: await q.answer("এটা তোমার জন্য নয়!",show_alert=True); return
-
-        # Token check
+        if is_banned(uid): await q.answer(BANNED, show_alert=True); return
+        parts  = d.split("_"); mode = parts[1]; target = int(parts[-1])
+        if uid != target: await q.answer("এটা তোমার জন্য নয়!", show_alert=True); return
         cost = COST['audio_translate'] if mode=='translate' else COST['audio_transcribe']
         bal  = get_tokens(uid)
         if bal < cost:
-            await q.answer(f"Token কম! লাগবে {cost}, আছে {bal}",show_alert=True)
-            try:
-                await q.edit_message_text(
-                    token_warn(cost,bal),parse_mode='Markdown',reply_markup=kb_back())
+            await q.answer(f"Token কম! লাগবে {cost}, আছে {bal}", show_alert=True)
+            try: await q.edit_message_text(token_warn(cost,bal), parse_mode='Markdown', reply_markup=kb_back())
             except: pass
             return
-
         await q.answer()
-        mode_txt={"bn":"🇧🇩 বাংলায় Transcription","en":"🇺🇸 English Transcription","translate":"🔄 Transcription + অনুবাদ"}.get(mode,"")
-        try:
-            await q.edit_message_text(f"✅ *{mode_txt} শুরু...*\n⏳ অপেক্ষা করো...",parse_mode='Markdown')
+        mode_txt = {"bn":"🇧🇩 বাংলায় Transcription","en":"🇺🇸 English Transcription",
+                    "translate":"🔄 Transcription + অনুবাদ"}.get(mode,"")
+        try: await q.edit_message_text(f"✅ *{mode_txt} শুরু...*\n⏳ অপেক্ষা করো...", parse_mode='Markdown')
         except: pass
-        asyncio.create_task(do_transcription(uid,mode,ctx.bot,q.message.chat_id))
+        asyncio.create_task(do_transcription(uid, mode, ctx.bot, q.message.chat_id))
         return
 
-    # ── Full access ──
-    if is_banned(uid): await q.answer("🚫 ban!",show_alert=True); return
-    if not await is_member(uid,ctx.bot):
-        await q.answer("🔒 চ্যানেলে যোগ দাও!",show_alert=True)
-        try: await q.edit_message_text(NOT_JOINED,parse_mode='Markdown',reply_markup=kb_not_joined())
+    # ── Full access check ──
+    if is_banned(uid): await q.answer("🚫 ban!", show_alert=True); return
+    if not await is_member(uid, ctx.bot):
+        await q.answer("🔒 চ্যানেলে যোগ দাও!", show_alert=True)
+        try: await q.edit_message_text(NOT_JOINED, parse_mode='Markdown', reply_markup=kb_not_joined())
         except: pass
         return
 
     await q.answer()
-    user=get_user(uid)
+    user = get_user(uid)
 
-    # ── SubDL download ──
+    # ── SubDL ──
     if d.startswith("subdl_"):
-        idx=d.split("_")[1]; url=ctx.user_data.get(f"suburl_{idx}",''); name=ctx.user_data.get(f"subname_{idx}",'subtitle.srt')
+        idx  = d.split("_")[1]
+        url  = ctx.user_data.get(f"suburl_{idx}", '')
+        name = ctx.user_data.get(f"subname_{idx}", 'subtitle.srt')
         if not url: await q.message.reply_text("❌ তথ্য নেই।"); return
-        await q.answer("⏳...")
-        loop=asyncio.get_event_loop(); content=await loop.run_in_executor(executor,subdl_dl,url)
-        if not content: await q.message.reply_text("❌ ডাউনলোড হয়নি।"); return
-        srt_b=content
-        if content[:2]==b'PK':
+        await q.answer("⏳ ডাউনলোড...")
+        loop    = asyncio.get_event_loop()
+        content = await loop.run_in_executor(executor, subdl_dl, url)
+        if not content:
+            await q.message.reply_text("❌ ডাউনলোড হয়নি।"); return
+        srt_b = content
+        if content[:2] == b'PK':
             import zipfile
             try:
                 with zipfile.ZipFile(io.BytesIO(content)) as z:
                     for n in z.namelist():
-                        if n.lower().endswith('.srt'): srt_b=z.read(n); name=os.path.basename(n); break
+                        if n.lower().endswith('.srt'):
+                            srt_b = z.read(n); name = os.path.basename(n); break
             except: pass
-        if not name.lower().endswith('.srt'): name+='.srt'
-        await q.message.reply_document(document=io.BytesIO(srt_b),filename=name,
-            caption=f"✅ *ডাউনলোড সম্পন্ন!*\n📁 `{name}`\n\n_এই ফাইলটা পাঠালে অনুবাদ করব!_ 🔄",
+        if not name.lower().endswith('.srt'): name += '.srt'
+        await q.message.reply_document(
+            document=io.BytesIO(srt_b), filename=name,
+            caption=f"✅ *ডাউনলোড সম্পন্ন!*\n📁 `{name}`\n\n_পাঠালে অনুবাদ করব!_ 🔄",
             parse_mode='Markdown')
         return
 
-    # ── Lang settings ──
+    # ── Lang ──
     if d.startswith("set_src_"):
-        lang=d.replace("set_src_",""); set_lang(uid,from_lang=lang)
+        lang = d.replace("set_src_",""); set_lang(uid, from_lang=lang)
         await q.edit_message_text(
             f"✅ Source: {SRC_LANGS.get(lang,lang)}\n\nTarget language বেছে নাও:",
-            parse_mode='Markdown',reply_markup=kb_dst_lang()); return
+            parse_mode='Markdown', reply_markup=kb_dst_lang()); return
     if d.startswith("set_dst_"):
-        lang=d.replace("set_dst_",""); set_lang(uid,to_lang=lang)
-        await q.edit_message_text(f"✅ *ভাষা সেটিং সেভ হয়েছে!*\n{SRC_LANGS.get(user['from_lang'],'Auto')} → {DST_LANGS.get(lang,lang)}",
-            parse_mode='Markdown',reply_markup=kb_home()); return
+        lang = d.replace("set_dst_",""); set_lang(uid, to_lang=lang)
+        await q.edit_message_text(
+            f"✅ *ভাষা সেটিং সেভ হয়েছে!*\n{SRC_LANGS.get(user['from_lang'],'Auto')} → {DST_LANGS.get(lang,lang)}",
+            parse_mode='Markdown', reply_markup=kb_home()); return
 
     # ── Chat ──
-    if d=="chat_start":
-        chat_mode[uid]=True
-        if uid not in chat_history: chat_history[uid]=[]
+    if d == "chat_start":
+        chat_mode[uid] = True
+        if uid not in chat_history: chat_history[uid] = []
         await q.edit_message_text(
             f"💬 *AI চ্যাট মোড চালু!*\n\n"
             f"প্রতি message-এ *{COST['chat_per_msg']} token* লাগবে।\n"
-            f"তোমার balance: *{user['tokens']} tokens*\n\n"
-            f"যা মনে চায় লেখো! 🤖",
-            parse_mode='Markdown',reply_markup=kb_chat()); return
-    if d=="chat_clear": chat_history[uid]=[]
-    if d in ("chat_clear","chat_stop"):
-        chat_mode[uid]= d!="chat_stop" and chat_mode.get(uid,False)
-        if d=="chat_stop": chat_mode[uid]=False
-        await q.edit_message_text("🗑 মুছা হয়েছে!" if d=="chat_clear" else "✅ চ্যাট বন্ধ।",
-            parse_mode='Markdown',reply_markup=kb_home() if d=="chat_stop" else kb_chat()); return
+            f"Balance: *{user['tokens']} tokens*\n\nযা মনে চায় লেখো! 🤖",
+            parse_mode='Markdown', reply_markup=kb_chat()); return
+    if d == "chat_clear":
+        chat_history[uid] = []
+        await q.edit_message_text("🗑 *মুছা হয়েছে!*", parse_mode='Markdown', reply_markup=kb_chat()); return
+    if d == "chat_stop":
+        chat_mode[uid] = False
+        await q.edit_message_text("✅ *চ্যাট বন্ধ।*", parse_mode='Markdown', reply_markup=kb_home()); return
 
     # ── Daily ──
-    if d=="daily":
-        ok,h=claim_daily(uid); bal=get_tokens(uid)
-        if ok: await q.edit_message_text(f"🎁 *+{DAILY_TOKENS} tokens!*\n💰 Balance: *{bal}*",parse_mode='Markdown',reply_markup=kb_home())
-        else: await q.edit_message_text(f"⏰ *{h} ঘণ্টা পরে।*\n💰 Balance: *{bal}*",parse_mode='Markdown',reply_markup=kb_home())
+    if d == "daily":
+        ok, h = claim_daily(uid); bal = get_tokens(uid)
+        if ok:
+            await q.edit_message_text(f"🎁 *+{DAILY_TOKENS} tokens!*\n💰 Balance: *{bal}*",
+                                      parse_mode='Markdown', reply_markup=kb_home())
+        else:
+            await q.edit_message_text(f"⏰ *{h} ঘণ্টা পরে।*\n💰 Balance: *{bal}*",
+                                      parse_mode='Markdown', reply_markup=kb_home())
         return
 
     # ── Token info ──
-    if d=="token_info":
-        bal=get_tokens(uid)
+    if d == "token_info":
+        bal = get_tokens(uid)
         await q.edit_message_text(
             f"🪙 *তোমার Balance: {bal} tokens*\n\n{token_info_text()}",
-            parse_mode='Markdown',reply_markup=kb_back()); return
+            parse_mode='Markdown', reply_markup=kb_back()); return
 
     # ── Profile ──
-    if d=="profile":
-        hist=get_history(uid,5); refs=ref_count(uid); badge="👑 Premium" if user['tokens']>=PREMIUM_THRESH else "🆓 Free"
-        ht=""
+    if d == "profile":
+        hist  = get_history(uid,5); refs = ref_count(uid)
+        badge = "👑 Premium" if user['tokens']>=PREMIUM_THRESH else "🆓 Free"
+        ht = ""
         if hist:
-            ht="\n\n📋 *শেষ ৫টি:*\n"
-            for h in hist: ht+=f"• `{h['file_name'][:20]}` {h['line_count']}লাইন -{h['cost']}🪙\n"
+            ht = "\n\n📋 *শেষ ৫টি:*\n"
+            for h in hist: ht += f"• `{h['file_name'][:20]}` {h['line_count']}লাইন -{h['cost']}🪙\n"
         await q.edit_message_text(
             f"👤 *প্রোফাইল*\n\n🎖 {badge} | 🪙 *{user['tokens']}*\n"
             f"🔄 {user['total_translations']} অনুবাদ | 📝 {user['total_lines']} লাইন\n"
             f"🤝 {refs} referral{ht}",
-            parse_mode='Markdown',reply_markup=kb_back()); return
+            parse_mode='Markdown', reply_markup=kb_back()); return
 
     # ── Tools ──
-    if d=="tools_menu":
-        await q.edit_message_text("🛠 *Subtitle Tools*\n\n⏱ Timing Fix — সময় ঠিক করো\n🔀 Merge — দুটো ফাইল এক করো",
-            parse_mode='Markdown',reply_markup=kb_tools()); return
-    if d=="tool_timing":
-        user_state[uid]={'action':'timing_wait_file'}
-        await q.edit_message_text("⏱ *Timing Fix*\n\nSubtitle ফাইল পাঠাও।",parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল",callback_data="home")]])); return
-    if d=="tool_merge":
-        user_state[uid]={'action':'merge_wait_first'}
-        await q.edit_message_text("🔀 *Merge*\n\n*প্রথম* ফাইলটা পাঠাও।",parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল",callback_data="home")]])); return
-
-    # ── YouTube ──
-    if d=="yt_info":
-        if not YT_AVAILABLE:
-            await q.edit_message_text("❌ yt-dlp install নেই।",parse_mode='Markdown',reply_markup=kb_back()); return
-        user_state[uid]={'action':'yt_wait_url'}
+    if d == "tools_menu":
         await q.edit_message_text(
-            f"▶️ *YouTube Subtitle*\n\n"
-            f"*খরচ: {COST['youtube']} tokens*\n"
-            f"তোমার balance: *{user['tokens']} tokens*\n\n"
-            f"YouTube video-র link পাঠাও।",
+            "🛠 *Subtitle Tools* 🆓\n\n⏱ Timing Fix\n🔀 Merge",
+            parse_mode='Markdown', reply_markup=kb_tools()); return
+    if d == "tool_timing":
+        user_state[uid] = {'action':'timing_wait_file'}
+        await q.edit_message_text("⏱ *Timing Fix*\n\nSubtitle ফাইল পাঠাও।",
             parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল",callback_data="home")]])); return
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল", callback_data="home")]])); return
+    if d == "tool_merge":
+        user_state[uid] = {'action':'merge_wait_first'}
+        await q.edit_message_text("🔀 *Merge*\n\n*প্রথম* ফাইলটা পাঠাও।",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল", callback_data="home")]])); return
+
+    # ── YouTube Subtitle ──
+    if d == "yt_info":
+        if not YT_AVAILABLE:
+            await q.edit_message_text("❌ yt-dlp install নেই।",
+                parse_mode='Markdown', reply_markup=kb_back()); return
+        user_state[uid] = {'action':'yt_wait_url'}
+        await q.edit_message_text(
+            f"▶️ *YouTube Subtitle অনুবাদ*\n\n"
+            f"💰 খরচ: *{COST['youtube']} tokens*\n"
+            f"তোমার balance: *{user['tokens']} tokens*\n\n"
+            f"YouTube video-র link পাঠাও।\n"
+            f"বট subtitle download করে অনুবাদ করবে!",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল", callback_data="home")]])); return
+
+    # ── YouTube Download ──
+    if d == "yt_download":
+        pending = ctx.user_data.get('yt_url_pending','')
+        if pending:
+            ctx.user_data.pop('yt_url_pending', None)
+            await q.edit_message_text("⏳ *Video download link তৈরি হচ্ছে...*\n\nএকটু অপেক্ষা করো...",
+                parse_mode='Markdown')
+            loop    = asyncio.get_event_loop()
+            result  = await loop.run_in_executor(executor, cobalt_get_link, pending, "1080")
+            if not result or not result.get('url'):
+                result = await loop.run_in_executor(executor, cobalt_get_link, pending, "720")
+            if not result or not result.get('url'):
+                await q.edit_message_text(
+                    "❌ *Download link তৈরি হয়নি!*\n\nVideo টি private বা age-restricted হতে পারে।",
+                    parse_mode='Markdown', reply_markup=kb_home()); return
+            dl_url = result.get('url',''); fname = result.get('filename','video.mp4')
+            await q.edit_message_text(
+                f"✅ *🎬 Download Link তৈরি হয়েছে!* 🆓\n\n"
+                f"📁 `{fname}`\n\n"
+                f"🔗 [👆 এখানে ক্লিক করো ডাউনলোড করতে]({dl_url})\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"⚠️ _Link ৬ ঘণ্টা valid থাকবে_",
+                parse_mode='Markdown', disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬇️ ডাউনলোড করো", url=dl_url)],
+                    [InlineKeyboardButton("📥 আরেকটি", callback_data="yt_download")],
+                    [InlineKeyboardButton("🔙 হোম", callback_data="home")]])); return
+
+        user_state[uid] = {'action':'yt_download_wait_url'}
+        await q.edit_message_text(
+            "📥 *YouTube Video ডাউনলোড* 🆓\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "YouTube video-র link পাঠাও।\n"
+            "বট একটি *direct download link* তৈরি করবে।\n\n"
+            "📌 link-এ click করলেই download শুরু হবে! ⬇️\n\n"
+            "✅ *সম্পূর্ণ বিনামূল্যে — কোনো token লাগবে না!*\n"
+            "⚠️ Link ৬ ঘণ্টা valid থাকবে।",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎵 শুধু MP3 Audio", callback_data="yt_dl_audio")],
+                [InlineKeyboardButton("❌ বাতিল",          callback_data="home")]])); return
+
+    # ── YouTube MP3 ──
+    if d == "yt_dl_audio":
+        pending = ctx.user_data.get('yt_url_pending','')
+        if pending:
+            ctx.user_data.pop('yt_url_pending', None)
+            await q.edit_message_text("⏳ *MP3 link তৈরি হচ্ছে...*", parse_mode='Markdown')
+            loop    = asyncio.get_event_loop()
+            result  = await loop.run_in_executor(executor, cobalt_get_audio, pending)
+            if not result or not result.get('url'):
+                await q.edit_message_text("❌ Audio link তৈরি হয়নি।", reply_markup=kb_home()); return
+            dl_url = result.get('url',''); fname = result.get('filename','audio.mp3')
+            await q.edit_message_text(
+                f"✅ *🎵 MP3 Link তৈরি হয়েছে!* 🆓\n\n"
+                f"📁 `{fname}`\n\n"
+                f"🔗 [👆 এখানে ক্লিক করো ডাউনলোড করতে]({dl_url})\n\n"
+                f"⚠️ _Link ৬ ঘণ্টা valid_",
+                parse_mode='Markdown', disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬇️ ডাউনলোড করো", url=dl_url)],
+                    [InlineKeyboardButton("🔙 হোম", callback_data="home")]])); return
+
+        user_state[uid] = {'action':'yt_download_audio_url'}
+        await q.edit_message_text(
+            "🎵 *MP3 Audio ডাউনলোড* 🆓\n\nYouTube link পাঠাও।",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল", callback_data="home")]])); return
 
     # ── Search ──
-    if d=="search":
-        if not SUBDL_API_KEY: await q.edit_message_text("❌ SUBDL_API_KEY নেই।",reply_markup=kb_back()); return
-        ctx.user_data['awaiting_search']=True
+    if d == "search":
+        if not SUBDL_API_KEY:
+            await q.edit_message_text("❌ SUBDL_API_KEY নেই।", reply_markup=kb_back()); return
+        ctx.user_data['awaiting_search'] = True
         await q.edit_message_text(
             "🔍 *Subtitle খোঁজো*\n\n"
-            "মুভির নাম লেখো — বানান একটু ভুল হলেও চলবে!\n\n"
+            "মুভির নাম লেখো — বানান ভুল হলেও চলবে!\n\n"
             "📌 `Pirats of Caribian` → ঠিক করে খুঁজবে ✨",
             parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল",callback_data="home")]])); return
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল", callback_data="home")]])); return
 
     # ── Audio info ──
-    if d=="audio_info":
+    if d == "audio_info":
         await q.edit_message_text(
             f"🎙 *Audio Transcription*\n\n"
             f"Voice message বা অডিও ফাইল পাঠাও!\n\n"
-            f"💰 Token খরচ:\n"
+            f"💰 Token:\n"
             f"• Transcription: *{COST['audio_transcribe']} tokens*\n"
             f"• + অনুবাদ: *{COST['audio_translate']} tokens*\n\n"
             f"সাপোর্টেড: `mp3 mp4 wav m4a ogg webm flac`\nMax: 25MB",
-            parse_mode='Markdown',reply_markup=kb_back()); return
+            parse_mode='Markdown', reply_markup=kb_back()); return
 
     # ── Lang menu ──
-    if d=="lang_menu":
+    if d == "lang_menu":
         await q.edit_message_text(
             f"🌐 *ভাষা সেটিং*\n\nবর্তমান: {SRC_LANGS.get(user['from_lang'],'Auto')} → {DST_LANGS.get(user['to_lang'],'বাংলা')}\n\nSource বেছে নাও:",
-            parse_mode='Markdown',reply_markup=kb_src_lang()); return
+            parse_mode='Markdown', reply_markup=kb_src_lang()); return
 
     # ── Help ──
-    if d=="help":
+    if d == "help":
         await q.edit_message_text(
             "📖 *ব্যবহার বিধি*\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
-            "*📁 ফাইল অনুবাদ:*\n"
-            f"SRT/VTT/ASS → ≤500লাইন ফ্রি, তারপর {COST['srt_per_500lines']}🪙/500লাইন\n\n"
-            f"*▶️ YouTube:* link → subtitle → অনুবাদ ({COST['youtube']}🪙)\n\n"
-            f"*🎙 Audio:* transcription ({COST['audio_transcribe']}🪙)\n\n"
-            f"*🛠 Tools:* Timing fix, Merge (ফ্রি)\n\n"
-            f"*💬 AI Chat:* {COST['chat_per_msg']}🪙/message\n\n"
+            "*📁 SRT অনুবাদ:*\n"
+            f"≤500লাইন ফ্রি | তারপর {COST['srt_per_500lines']}🪙/500লাইন\n\n"
+            f"*▶️ YouTube Subtitle:* {COST['youtube']}🪙\n"
+            f"*📥 YouTube Download:* ফ্রি 🆓\n"
+            f"*🎙 Audio:* {COST['audio_transcribe']}🪙\n"
+            f"*🛠 Tools:* ফ্রি 🆓\n"
+            f"*💬 Chat:* {COST['chat_per_msg']}🪙/msg\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
-            "🎁 `/promo PREMIUMBOT` → 50 tokens ফ্রি!\n"
+            "🎁 `/promo PREMIUMBOT` → 50 tokens!\n"
             "📌 `/daily` `/referral` `/profile`",
-            parse_mode='Markdown',reply_markup=kb_back()); return
+            parse_mode='Markdown', reply_markup=kb_back()); return
 
     # ── Status ──
-    if d=="status":
+    if d == "status":
         await q.edit_message_text(
             f"📊 *স্ট্যাটাস*\n\n🟢 Online | 🪙 Token: *{user['tokens']}*",
-            parse_mode='Markdown',reply_markup=kb_back()); return
+            parse_mode='Markdown', reply_markup=kb_back()); return
 
     # ── Admin ──
     if d.startswith("adm_") and uid in ADMIN_IDS:
-        action=d.replace("adm_","")
-        if action=="stats":
-            s=get_stats()
-            await q.edit_message_text(f"📊\n👥{s['users']} | ✅{s['active']} | 🔄{s['translations']} | 📝{s['lines']}",reply_markup=kb_admin()); return
-        for act,prompt in [("broadcast","📢 Broadcast message লেখো:"),
-                           ("ban","🚫 Ban User ID:"),("unban","✅ Unban User ID:"),
-                           ("lookup","👤 User ID:"),("tokens","🪙 User ID:")]:
-            if action==act:
-                user_state[uid]={'action':f'admin_{act}'}
-                await q.edit_message_text(prompt,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌",callback_data="home")]])); return
+        action = d.replace("adm_","")
+        if action == "stats":
+            s = get_stats()
+            await q.edit_message_text(
+                f"📊\n👥{s['users']} | ✅{s['active']} | 🔄{s['translations']} | 📝{s['lines']}",
+                reply_markup=kb_admin()); return
+        for act, prompt in [("broadcast","📢 message লেখো:"),("ban","🚫 User ID:"),
+                             ("unban","✅ User ID:"),("lookup","👤 User ID:"),("tokens","🪙 User ID:")]:
+            if action == act:
+                user_state[uid] = {'action':f'admin_{act}'}
+                await q.edit_message_text(prompt,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌", callback_data="home")]])); return
 
     # ── Home ──
-    if d=="home":
-        chat_mode[uid]=False; ctx.user_data['awaiting_search']=False; user_state.pop(uid,None)
-        await q.edit_message_text("🎬 *Subtitle BD Bot*\n\nফাইল পাঠাও বা বাটন চাপো! 🚀",
-            parse_mode='Markdown',reply_markup=kb_home())
-
-# ══════════════════════════════════════════════
-# 🎙  TRANSCRIPTION TASK
-# ══════════════════════════════════════════════
-async def do_transcription(uid, mode, bot, chat_id):
-    info=pending_audio.get(uid)
-    if not info: await bot.send_message(chat_id,"❌ অডিও নেই।"); return
-    pending_audio.pop(uid,None)
-    cost=COST['audio_translate'] if mode=='translate' else COST['audio_transcribe']
-    # Deduct tokens
-    if not deduct_tokens(uid,cost):
-        bal=get_tokens(uid)
-        await bot.send_message(chat_id,token_warn(cost,bal),parse_mode='Markdown',reply_markup=kb_back()); return
-
-    status=await bot.send_message(chat_id,"⏳ *Transcription চলছে...*",parse_mode='Markdown')
-    try:
-        f=await bot.get_file(info['file_id']); raw=await f.download_as_bytearray()
-        loop=asyncio.get_event_loop()
-        lang='bn' if mode=='bn' else 'en'
-        tr=await loop.run_in_executor(executor,functools.partial(transcribe,bytes(raw),info['file_name'],lang))
-        if not tr or not tr.strip():
-            await bot.edit_message_text("❌ কথা পাওয়া যায়নি!",chat_id=chat_id,message_id=status.message_id,reply_markup=kb_back())
-            add_tokens(uid,cost); return  # refund
-        bal=get_tokens(uid)
-        if mode in ('bn','en'):
-            flag="🇧🇩" if mode=='bn' else "🇺🇸"
-            text=f"✅ *{flag} Transcription সম্পন্ন!*\n🪙 -{cost} | Balance: *{bal}*\n\n━━━━━━━━\n{tr}\n━━━━━━━━"
-            if len(text)>4096:
-                await bot.edit_message_text("✅ সম্পন্ন! ফাইল পাঠাচ্ছি...",chat_id=chat_id,message_id=status.message_id)
-                await bot.send_document(chat_id,document=io.BytesIO(tr.encode()),filename="transcript.txt",reply_markup=kb_home())
-            else:
-                await bot.edit_message_text(text,chat_id=chat_id,message_id=status.message_id,parse_mode='Markdown',reply_markup=kb_home())
-        else:
-            await bot.edit_message_text("🔄 অনুবাদ করছি...",chat_id=chat_id,message_id=status.message_id)
-            user=get_user(uid); bn=await loop.run_in_executor(executor,functools.partial(trans_plain,tr,user['to_lang']))
-            combined=f"🇺🇸 *English:*\n{tr}\n\n🇧🇩 *Translation:*\n{bn}"
-            if len(combined)>4096:
-                full=f"=== English ===\n{tr}\n\n=== Translation ===\n{bn}"
-                await bot.edit_message_text("✅ সম্পন্ন!",chat_id=chat_id,message_id=status.message_id)
-                await bot.send_document(chat_id,document=io.BytesIO(full.encode()),filename="transcript_translated.txt",reply_markup=kb_home())
-            else:
-                await bot.edit_message_text(f"✅ *সম্পন্ন!* 🪙 -{cost} | Balance: *{bal}*\n\n{combined}",
-                    chat_id=chat_id,message_id=status.message_id,parse_mode='Markdown',reply_markup=kb_home())
-    except Exception as e:
-        err=str(e); add_tokens(uid,cost)  # refund on error
-        notice=QUOTA_MSG if "QUOTA_EXCEEDED" in err else f"❌ সমস্যা: `{err[:150]}`"
-        try: await bot.edit_message_text(notice,chat_id=chat_id,message_id=status.message_id,
-                                          parse_mode='Markdown',reply_markup=kb_quota() if "QUOTA" in err else kb_back())
-        except: pass
+    if d == "home":
+        chat_mode[uid] = False
+        ctx.user_data['awaiting_search'] = False
+        ctx.user_data.pop('yt_url_pending', None)
+        user_state.pop(uid, None)
+        await q.edit_message_text(
+            "🎬 *Subtitle BD Bot*\n\nফাইল বা YouTube link পাঠাও! 🚀",
+            parse_mode='Markdown', reply_markup=kb_home())
 
 # ══════════════════════════════════════════════
 # 📁  FILE HANDLER
 # ══════════════════════════════════════════════
 async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u=update.effective_user; doc=update.message.document
-    if not await check_access(u.id,ctx.bot,update.message.reply_text): return
-    fname=(doc.file_name or '').lower(); user=get_user(u.id,u.username,u.first_name); state=user_state.get(u.id,{})
+    u   = update.effective_user
+    doc = update.message.document
+    if not await check_access(u.id, ctx.bot, update.message.reply_text): return
 
-    # Tools: timing
+    fname = (doc.file_name or '').lower()
+    user  = get_user(u.id, u.username, u.first_name)
+    state = user_state.get(u.id, {})
+
+    # Timing wait
     if state.get('action')=='timing_wait_file' and fname.endswith(('.srt','.vtt','.ass','.ssa')):
-        user_state[u.id]={'action':'timing_wait_offset','file_id':doc.file_id,'file_name':doc.file_name}
-        await update.message.reply_text("✅ ফাইল পেয়েছি!\n\nকত সেকেন্ড shift? (+5 বা -3.5)",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল",callback_data="home")]])); return
+        user_state[u.id] = {'action':'timing_wait_offset','file_id':doc.file_id,'file_name':doc.file_name}
+        await update.message.reply_text("✅ ফাইল পেয়েছি!\n\nকত সেকেন্ড shift? (যেমন: +5 বা -3.5)",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল", callback_data="home")]])); return
 
-    # Tools: merge first
+    # Merge first
     if state.get('action')=='merge_wait_first' and fname.endswith(('.srt','.vtt','.ass','.ssa')):
-        user_state[u.id]={'action':'merge_wait_second','file1_id':doc.file_id,'file1_name':doc.file_name}
+        user_state[u.id] = {'action':'merge_wait_second','file1_id':doc.file_id,'file1_name':doc.file_name}
         await update.message.reply_text("✅ প্রথম ফাইল পেয়েছি!\n\n*দ্বিতীয়* ফাইলটা পাঠাও।",
             parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল",callback_data="home")]])); return
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল", callback_data="home")]])); return
 
-    # Tools: merge second
+    # Merge second
     if state.get('action')=='merge_wait_second' and fname.endswith(('.srt','.vtt','.ass','.ssa')):
-        msg=await update.message.reply_text("⏳ Merge হচ্ছে...")
+        msg = await update.message.reply_text("⏳ Merge হচ্ছে...")
         try:
-            f1=await ctx.bot.get_file(state['file1_id']); r1=await f1.download_as_bytearray()
-            f2=await ctx.bot.get_file(doc.file_id); r2=await f2.download_as_bytearray()
-            b1=parse_auto(r1.decode('utf-8-sig','ignore'),state['file1_name'])
-            b2=parse_auto(r2.decode('utf-8-sig','ignore'),doc.file_name)
-            merged=merge_subtitles(b1,b2); out=build_srt(merged).encode('utf-8-sig')
+            f1 = await ctx.bot.get_file(state['file1_id']); r1 = await f1.download_as_bytearray()
+            f2 = await ctx.bot.get_file(doc.file_id);       r2 = await f2.download_as_bytearray()
+            b1 = parse_auto(r1.decode('utf-8-sig','ignore'), state['file1_name'])
+            b2 = parse_auto(r2.decode('utf-8-sig','ignore'), doc.file_name)
+            merged = merge_subtitles(b1, b2); out = build_srt(merged).encode('utf-8-sig')
             await msg.delete()
-            await update.message.reply_document(document=io.BytesIO(out),filename="merged_subtitle.srt",
-                caption=f"✅ *Merge সম্পন্ন!*\n{len(b1)}+{len(b2)}=*{len(merged)} লাইন* 🆓",
-                parse_mode='Markdown',reply_markup=kb_home())
-        except Exception as e: await msg.edit_text(f"❌ সমস্যা: `{str(e)[:100]}`",parse_mode='Markdown')
-        user_state.pop(u.id,None); return
+            await update.message.reply_document(
+                document=io.BytesIO(out), filename="merged_subtitle.srt",
+                caption=f"✅ *Merge সম্পন্ন!* 🆓\n{len(b1)}+{len(b2)}=*{len(merged)} লাইন*",
+                parse_mode='Markdown', reply_markup=kb_home())
+        except Exception as e: await msg.edit_text(f"❌ `{str(e)[:100]}`", parse_mode='Markdown')
+        user_state.pop(u.id, None); return
 
     # Audio file
     if any(fname.endswith(ext) for ext in AUDIO_EXTS):
-        if doc.file_size and doc.file_size>MAX_AUDIO: await update.message.reply_text("❌ ২৫MB-এর বেশি!"); return
-        pending_audio[u.id]={'file_id':doc.file_id,'file_name':doc.file_name or 'audio.mp3'}
-        await update.message.reply_text(f"🎙 *অডিও পেয়েছি!*\n📁 `{doc.file_name}`\n\nকী করতে চাও?",
-            parse_mode='Markdown',reply_markup=kb_audio(u.id)); return
+        if doc.file_size and doc.file_size > MAX_AUDIO:
+            await update.message.reply_text("❌ ২৫MB-এর বেশি!"); return
+        pending_audio[u.id] = {'file_id':doc.file_id,'file_name':doc.file_name or 'audio.mp3'}
+        await update.message.reply_text(
+            f"🎙 *অডিও পেয়েছি!*\n📁 `{doc.file_name}`\n\nকী করতে চাও?",
+            parse_mode='Markdown', reply_markup=kb_audio(u.id)); return
 
     # SRT/VTT/ASS
     if not fname.endswith(('.srt','.vtt','.ass','.ssa')):
-        await update.message.reply_text("❌ সাপোর্টেড: `.srt` `.vtt` `.ass` বা অডিও ফাইল",parse_mode='Markdown'); return
+        await update.message.reply_text(
+            "❌ সাপোর্টেড ফাইল: `.srt` `.vtt` `.ass` বা অডিও `mp3 wav m4a`",
+            parse_mode='Markdown'); return
 
     if u.id in active_tasks and not active_tasks[u.id]:
-        await update.message.reply_text("⚠️ একটি অনুবাদ চলছে!"); return
+        await update.message.reply_text("⚠️ একটি অনুবাদ চলছে! আগেরটা শেষ করো।"); return
 
-    # Read file first to count lines
-    max_mb=10*1024*1024 if user['tokens']>=PREMIUM_THRESH else 5*1024*1024
-    if doc.file_size and doc.file_size>max_mb:
-        await update.message.reply_text(f"❌ ফাইল সাইজ সীমা অতিক্রম করেছে!\n_(Free: 5MB, 100+ tokens: 10MB)_",parse_mode='Markdown'); return
+    max_mb = 10*1024*1024 if user['tokens']>=PREMIUM_THRESH else 5*1024*1024
+    if doc.file_size and doc.file_size > max_mb:
+        await update.message.reply_text(
+            f"❌ ফাইল সাইজ সীমা অতিক্রম!\n_(Free: 5MB, 100+ tokens: 10MB)_",
+            parse_mode='Markdown'); return
 
-    # Download to check line count and calculate cost
-    f=await ctx.bot.get_file(doc.file_id); raw=await f.download_as_bytearray()
-    content=None
+    f   = await ctx.bot.get_file(doc.file_id); raw = await f.download_as_bytearray()
+    content = None
     for enc in ['utf-8-sig','utf-8','latin-1','cp1252']:
-        try: content=raw.decode(enc); break
+        try: content = raw.decode(enc); break
         except: continue
     if not content: await update.message.reply_text("❌ ফাইল পড়া যাচ্ছে না!"); return
-    blocks=parse_auto(content,doc.file_name)
-    if not blocks: await update.message.reply_text("❌ SRT ফাইলে কোনো subtitle নেই!"); return
+    blocks = parse_auto(content, doc.file_name)
+    if not blocks: await update.message.reply_text("❌ subtitle নেই!"); return
 
-    total=len(blocks); cost=calc_srt_cost(total); bal=get_tokens(u.id)
+    total = len(blocks); cost = calc_srt_cost(total); bal = get_tokens(u.id)
+    if bal < cost:
+        await update.message.reply_text(token_warn(cost,bal), parse_mode='Markdown', reply_markup=kb_back()); return
 
-    # Token check
-    if bal<cost:
-        await update.message.reply_text(token_warn(cost,bal),parse_mode='Markdown',reply_markup=kb_back()); return
+    deduct_tokens(u.id, cost)
+    user_state.pop(u.id, None); chat_mode[u.id] = False
+    active_tasks[u.id] = False; cancel_events[u.id] = threading.Event()
+    ce = cancel_events[u.id]
+    fl = user.get('from_lang','auto'); tl = user.get('to_lang','bn')
+    lang_disp = f"{SRC_LANGS.get(fl,'Auto')} → {DST_LANGS.get(tl,'বাংলা')}"
+    new_bal   = get_tokens(u.id)
 
-    # Deduct tokens
-    deduct_tokens(u.id,cost)
-
-    user_state.pop(u.id,None); chat_mode[u.id]=False
-    active_tasks[u.id]=False; cancel_events[u.id]=threading.Event(); ce=cancel_events[u.id]
-    fl=user.get('from_lang','auto'); tl=user.get('to_lang','bn')
-    lang_disp=f"{SRC_LANGS.get(fl,'Auto')} → {DST_LANGS.get(tl,'বাংলা')}"
-    new_bal=get_tokens(u.id)
-
-    status=await update.message.reply_photo(
+    status = await update.message.reply_photo(
         photo=pie_chart(0,1),
-        caption=(f"📥 *ফাইল পেয়েছি!*\n\n"
-                 f"📁 `{doc.file_name}`\n🌐 {lang_disp}\n"
-                 f"📊 {total} লাইন | 🪙 -{cost} token\n"
+        caption=(f"📥 *ফাইল পেয়েছি!*\n\n📁 `{doc.file_name}`\n"
+                 f"🌐 {lang_disp}\n📊 {total} লাইন | 🪙 -{cost} token\n"
                  f"💰 Balance: *{new_bal}*\n⏳ শুরু হচ্ছে..."),
-        parse_mode='Markdown',reply_markup=kb_cancel(u.id))
+        parse_mode='Markdown', reply_markup=kb_cancel(u.id))
 
     try:
-        BATCH=7; translated=list(blocks); completed=0; loop=asyncio.get_event_loop()
         await status.edit_media(InputMediaPhoto(
             media=pie_chart(0,total),
             caption=(f"🎬 *অনুবাদ শুরু হচ্ছে...*\n\n📁 `{doc.file_name}`\n"
-                     f"🌐 {lang_disp}\n📊 মোট: *{total}টি*\n"
-                     f"🪙 -{cost} tokens | Balance: *{new_bal}*\n"
+                     f"🌐 {lang_disp} | 📊 মোট: *{total}টি*\n"
+                     f"🪙 -{cost} | Balance: *{new_bal}*\n"
                      f"━━━━━━━━━━━━━━━━━━━━━\n⏳ 0/{total}"),
-            parse_mode='Markdown'),reply_markup=kb_cancel(u.id))
+            parse_mode='Markdown'), reply_markup=kb_cancel(u.id))
 
-        for i in range(0,total,BATCH):
-            if ce.is_set() or active_tasks.get(u.id,False): add_tokens(u.id,cost); return  # refund on cancel
-            chunk=blocks[i:i+BATCH]; texts=[b['text'] for b in chunk]
-            result=await loop.run_in_executor(executor,functools.partial(tbatch,texts,fl,tl,ce))
+        BATCH = 7; translated = list(blocks); completed = 0; loop = asyncio.get_event_loop()
+        for i in range(0, total, BATCH):
+            if ce.is_set() or active_tasks.get(u.id,False): add_tokens(u.id,cost); return
+            chunk  = blocks[i:i+BATCH]; texts = [b['text'] for b in chunk]
+            result = await loop.run_in_executor(executor, functools.partial(tbatch,texts,fl,tl,ce))
             if ce.is_set() or active_tasks.get(u.id,False): add_tokens(u.id,cost); return
             for j,tr in enumerate(result):
                 if i+j<total: translated[i+j]['text']=tr
-            completed=min(i+BATCH,total); pct=completed/total*100
-            bar='█'*int(pct/5)+'░'*(20-int(pct/5))
+            completed = min(i+BATCH,total); pct = completed/total*100
+            bar = '█'*int(pct/5)+'░'*(20-int(pct/5))
             try:
                 await status.edit_media(InputMediaPhoto(
                     media=pie_chart(completed,total),
                     caption=(f"🔄 *অনুবাদ চলছে...*\n\n📁 `{doc.file_name}`\n"
                              f"`[{bar}]` *{pct:.1f}%*\n🌐 {lang_disp}\n"
                              f"━━━━━━━━━━━━━━━━━━━━━\n✅ {completed}/{total}"),
-                    parse_mode='Markdown'),reply_markup=kb_cancel(u.id))
+                    parse_mode='Markdown'), reply_markup=kb_cancel(u.id))
             except Exception as e: logger.warning(f"Edit ignored: {e}")
             await asyncio.sleep(0.4)
 
         if ce.is_set() or active_tasks.get(u.id,False): add_tokens(u.id,cost); return
 
-        out=build_srt(translated).encode('utf-8-sig')
-        out_name=re.sub(r'\.(srt|vtt|ass|ssa)$','_Bengali.srt',doc.file_name,flags=re.IGNORECASE)
-        final_bal=get_tokens(u.id); add_tokens(u.id,2)  # +2 bonus
+        out   = build_srt(translated).encode('utf-8-sig')
+        oname = re.sub(r'\.(srt|vtt|ass|ssa)$','_Bengali.srt',doc.file_name,flags=re.IGNORECASE)
+        final = get_tokens(u.id); add_tokens(u.id,2)
 
         await status.edit_media(InputMediaPhoto(
             media=pie_chart(total,total),
             caption=(f"✅ *অনুবাদ সম্পন্ন!*\n\n📁 `{doc.file_name}`\n"
                      f"🎉 *{total}টি* লাইন | 🌐 {lang_disp}\n"
-                     f"🪙 -{cost} tokens | +2 bonus\n"
-                     f"💰 Balance: *{final_bal+2}*"),
+                     f"🪙 -{cost}+2bonus | Balance: *{final+2}*"),
             parse_mode='Markdown'))
 
         await update.message.reply_document(
-            document=io.BytesIO(out),filename=out_name,
-            caption=(f"🎬 *অনুবাদিত ফাইল*\n\n📁 `{out_name}`\n"
-                     f"✅ *{total}* লাইন | 🌐 {lang_disp}\n"
-                     f"⏱ Timing অক্ষুণ্ণ\n\n_VLC / MX Player-এ ব্যবহার করো_ 🎥"),
-            parse_mode='Markdown',reply_markup=kb_home())
+            document=io.BytesIO(out), filename=oname,
+            caption=(f"🎬 *অনুবাদিত ফাইল*\n\n📁 `{oname}`\n"
+                     f"✅ *{total}* লাইন | ⏱ Timing অক্ষুণ্ণ\n\n"
+                     f"_VLC / MX Player-এ ব্যবহার করো_ 🎥"),
+            parse_mode='Markdown', reply_markup=kb_home())
 
-        log_history(u.id,doc.file_name,total,fl,tl,cost)
-        logger.info(f"✅ {total} lines for {u.id}")
+        log_history(u.id, doc.file_name, total, fl, tl, cost)
 
     except Exception as e:
-        err=str(e); add_tokens(u.id,cost)  # refund
-        logger.error(f"Error {u.id}: {err}")
-        notice=QUOTA_MSG if "QUOTA_EXCEEDED" in err else f"❌ সমস্যা!\n\n`{err[:200]}`\n\n_Token ফেরত দেওয়া হয়েছে।_"
-        kb=kb_quota() if "QUOTA_EXCEEDED" in err else kb_home()
-        try: await status.edit_caption(notice,parse_mode='Markdown',reply_markup=kb)
-        except: await update.message.reply_text(notice,parse_mode='Markdown',reply_markup=kb)
+        err = str(e); add_tokens(u.id, cost)
+        notice = QUOTA_MSG if "QUOTA_EXCEEDED" in err else f"❌ সমস্যা!\n\n`{err[:200]}`\n\n_Token ফেরত দেওয়া হয়েছে।_"
+        kb = kb_quota() if "QUOTA_EXCEEDED" in err else kb_home()
+        try: await status.edit_caption(notice, parse_mode='Markdown', reply_markup=kb)
+        except: await update.message.reply_text(notice, parse_mode='Markdown', reply_markup=kb)
     finally:
-        active_tasks.pop(u.id,None); cancel_events.pop(u.id,None)
+        active_tasks.pop(u.id, None); cancel_events.pop(u.id, None)
 
 # ══════════════════════════════════════════════
-# 🎤  VOICE / AUDIO
+# 🎤  VOICE / AUDIO HANDLER
 # ══════════════════════════════════════════════
 async def handle_audio_or_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u=update.effective_user; msg=update.message
-    if not await check_access(u.id,ctx.bot,update.message.reply_text): return
-    if msg.voice: fo,fn,fs=msg.voice,f"voice_{u.id}.ogg",msg.voice.file_size
-    elif msg.audio: fo,fn,fs=msg.audio,(msg.audio.file_name or "audio.mp3"),msg.audio.file_size
+    u   = update.effective_user
+    msg = update.message
+    if not await check_access(u.id, ctx.bot, update.message.reply_text): return
+    if msg.voice:   fo,fn,fs = msg.voice, f"voice_{u.id}.ogg", msg.voice.file_size
+    elif msg.audio: fo,fn,fs = msg.audio, (msg.audio.file_name or "audio.mp3"), msg.audio.file_size
     else: return
-    if fs and fs>MAX_AUDIO: await msg.reply_text("❌ ২৫MB-এর বেশি!"); return
-    pending_audio[u.id]={'file_id':fo.file_id,'file_name':fn}
+    if fs and fs > MAX_AUDIO: await msg.reply_text("❌ ২৫MB-এর বেশি!"); return
+    pending_audio[u.id] = {'file_id':fo.file_id,'file_name':fn}
     await msg.reply_text(f"🎙 *অডিও পেয়েছি!*\n📁 `{fn}`\n\nকী করতে চাও?",
-        parse_mode='Markdown',reply_markup=kb_audio(u.id))
+        parse_mode='Markdown', reply_markup=kb_audio(u.id))
 
 # ══════════════════════════════════════════════
 # 💬  TEXT HANDLER
 # ══════════════════════════════════════════════
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u=update.effective_user; text=update.message.text.strip()
-    if not await check_access(u.id,ctx.bot,update.message.reply_text): return
-    user=get_user(u.id,u.username,u.first_name); state=user_state.get(u.id,{})
+    u     = update.effective_user
+    text  = update.message.text.strip()
+    if not await check_access(u.id, ctx.bot, update.message.reply_text): return
+    user  = get_user(u.id, u.username, u.first_name)
+    state = user_state.get(u.id, {})
 
-    # Timing offset
-    if state.get('action')=='timing_wait_offset':
-        try: offset=float(text.replace(',','.'))
+    # ── Timing offset ──
+    if state.get('action') == 'timing_wait_offset':
+        try: offset = float(text.replace(',','.'))
         except: await update.message.reply_text("❌ সংখ্যা লেখো! (+5 বা -3.5)"); return
-        msg=await update.message.reply_text("⏳ Timing ঠিক করছি...")
+        msg = await update.message.reply_text("⏳ Timing ঠিক করছি...")
         try:
-            f=await ctx.bot.get_file(state['file_id']); raw=await f.download_as_bytearray()
-            content=raw.decode('utf-8-sig','ignore'); blocks=parse_auto(content,state['file_name'])
-            fixed=fix_timing(blocks,offset); out=build_srt(fixed).encode('utf-8-sig')
-            out_name=re.sub(r'\.srt$',f'_shifted{offset:+g}s.srt',state['file_name'])
+            f   = await ctx.bot.get_file(state['file_id']); raw = await f.download_as_bytearray()
+            content = raw.decode('utf-8-sig','ignore'); blocks = parse_auto(content, state['file_name'])
+            fixed   = fix_timing(blocks, offset); out = build_srt(fixed).encode('utf-8-sig')
+            oname   = re.sub(r'\.srt$', f'_shifted{offset:+g}s.srt', state['file_name'])
             await msg.delete()
-            await update.message.reply_document(document=io.BytesIO(out),filename=out_name,
+            await update.message.reply_document(
+                document=io.BytesIO(out), filename=oname,
                 caption=f"✅ *Timing Fix সম্পন্ন!* 🆓\n\n⏱ Shift: `{offset:+g}` সেকেন্ড\n{len(fixed)} লাইন",
-                parse_mode='Markdown',reply_markup=kb_home())
-        except Exception as e: await msg.edit_text(f"❌ `{str(e)[:100]}`",parse_mode='Markdown')
-        user_state.pop(u.id,None); return
+                parse_mode='Markdown', reply_markup=kb_home())
+        except Exception as e: await msg.edit_text(f"❌ `{str(e)[:100]}`", parse_mode='Markdown')
+        user_state.pop(u.id, None); return
 
-    # Admin
-    if state.get('action')=='admin_broadcast' and u.id in ADMIN_IDS:
-        uids=all_uids(); msg=await update.message.reply_text(f"📢 পাঠাচ্ছি {len(uids)} জনকে...")
-        ok=fail=0
+    # ── Admin ──
+    if state.get('action') == 'admin_broadcast' and u.id in ADMIN_IDS:
+        uids = all_uids(); msg = await update.message.reply_text(f"📢 পাঠাচ্ছি {len(uids)} জনকে...")
+        ok = fail = 0
         for uid2 in uids:
-            try: await ctx.bot.send_message(uid2,text,parse_mode='Markdown'); ok+=1
+            try: await ctx.bot.send_message(uid2, text, parse_mode='Markdown'); ok+=1
             except: fail+=1
             await asyncio.sleep(0.05)
         await msg.edit_text(f"✅ Broadcast সম্পন্ন!\n✅{ok} ❌{fail}")
-        user_state.pop(u.id,None); return
+        user_state.pop(u.id, None); return
 
     for act in ['admin_ban','admin_unban']:
         if state.get('action')==act and u.id in ADMIN_IDS:
             try:
                 ban_user(int(text), act=='admin_ban')
-                await update.message.reply_text(f"✅ User `{text}` {'ban' if act=='admin_ban' else 'unban'} হয়েছে।",
-                    parse_mode='Markdown',reply_markup=kb_admin())
-            except: await update.message.reply_text("❌ ভুল ID")
-            user_state.pop(u.id,None); return
-
-    if state.get('action')=='admin_lookup' and u.id in ADMIN_IDS:
-        try:
-            con=db(); c=con.cursor(); c.execute("SELECT * FROM users WHERE uid=?",(int(text),)); row=c.fetchone(); con.close()
-            if row:
-                row=dict(row)
                 await update.message.reply_text(
-                    f"👤 ID:`{row['uid']}` | {row['first_name']}\n🪙{row['tokens']} | 🔄{row['total_translations']} | 🚫{bool(row['is_banned'])}",
+                    f"✅ User `{text}` {'ban' if act=='admin_ban' else 'unban'} হয়েছে।",
+                    parse_mode='Markdown', reply_markup=kb_admin())
+            except: await update.message.reply_text("❌ ভুল ID")
+            user_state.pop(u.id, None); return
+
+    if state.get('action') == 'admin_lookup' and u.id in ADMIN_IDS:
+        try:
+            con = db(); c = con.cursor()
+            c.execute("SELECT * FROM users WHERE uid=?", (int(text),))
+            row = c.fetchone(); con.close()
+            if row:
+                row = dict(row)
+                await update.message.reply_text(
+                    f"👤 ID:`{row['uid']}` | {row['first_name']}\n"
+                    f"🪙{row['tokens']} | 🔄{row['total_translations']} | 🚫{bool(row['is_banned'])}",
                     reply_markup=kb_admin())
             else: await update.message.reply_text("❌ পাওয়া যায়নি।")
         except: await update.message.reply_text("❌ ভুল ID")
-        user_state.pop(u.id,None); return
+        user_state.pop(u.id, None); return
 
-    if state.get('action')=='admin_tokens_uid' and u.id in ADMIN_IDS:
-        try: user_state[u.id]={'action':'admin_tokens_amount','target':int(text)}; await update.message.reply_text("কত token?")
+    if state.get('action') == 'admin_tokens_uid' and u.id in ADMIN_IDS:
+        try: user_state[u.id] = {'action':'admin_tokens_amount','target':int(text)}; await update.message.reply_text("কত token?")
         except: await update.message.reply_text("❌ ভুল ID")
         return
 
-    if state.get('action')=='admin_tokens_amount' and u.id in ADMIN_IDS:
+    if state.get('action') == 'admin_tokens_amount' and u.id in ADMIN_IDS:
         try:
-            t=state['target']; n=int(text); add_tokens(t,n)
-            await update.message.reply_text(f"✅ `{t}` কে *{n} tokens* দেওয়া হয়েছে।",parse_mode='Markdown',reply_markup=kb_admin())
+            t = state['target']; n = int(text); add_tokens(t,n)
+            await update.message.reply_text(f"✅ `{t}` কে *{n} tokens* দেওয়া হয়েছে।",
+                parse_mode='Markdown', reply_markup=kb_admin())
         except: await update.message.reply_text("❌ ভুল")
-        user_state.pop(u.id,None); return
+        user_state.pop(u.id, None); return
 
-    # YouTube
-    if state.get('action')=='yt_wait_url':
+    # ── YouTube Subtitle ──
+    if state.get('action') == 'yt_wait_url':
         if not ('youtube.com' in text or 'youtu.be' in text):
             await update.message.reply_text("❌ সঠিক YouTube link দাও!"); return
-
-        cost=COST['youtube']; bal=get_tokens(u.id)
-        if bal<cost:
-            user_state.pop(u.id,None)
-            await update.message.reply_text(token_warn(cost,bal),parse_mode='Markdown',reply_markup=kb_back()); return
-
-        deduct_tokens(u.id,cost); user_state.pop(u.id,None)
-        msg=await update.message.reply_text("▶️ *YouTube subtitle download হচ্ছে...*\n⏳",parse_mode='Markdown')
-        loop=asyncio.get_event_loop()
-        content,title=await loop.run_in_executor(executor,functools.partial(yt_subtitle,text,'en'))
+        cost = COST['youtube']; bal = get_tokens(u.id)
+        if bal < cost:
+            user_state.pop(u.id, None)
+            await update.message.reply_text(token_warn(cost,bal), parse_mode='Markdown', reply_markup=kb_back()); return
+        deduct_tokens(u.id, cost); user_state.pop(u.id, None)
+        msg = await update.message.reply_text("▶️ *YouTube subtitle download হচ্ছে...*\n⏳", parse_mode='Markdown')
+        loop = asyncio.get_event_loop()
+        content, title = await loop.run_in_executor(executor, functools.partial(yt_subtitle, text, 'en'))
         if not content:
-            add_tokens(u.id,cost)  # refund
-            await msg.edit_text("❌ *Subtitle পাওয়া যায়নি!*\n\n_Token ফেরত দেওয়া হয়েছে।_",parse_mode='Markdown',reply_markup=kb_back()); return
-
-        blocks=parse_vtt(content) if content.startswith('WEBVTT') else parse_srt(content)
-        if not blocks: add_tokens(u.id,cost); await msg.edit_text("❌ Parse করা যায়নি!",reply_markup=kb_back()); return
-
-        total=len(blocks); fl=user.get('from_lang','auto'); tl=user.get('to_lang','bn'); translated=list(blocks)
-        for i in range(0,total,7):
-            chunk=blocks[i:i+7]; texts=[b['text'] for b in chunk]
-            result=await loop.run_in_executor(executor,functools.partial(tbatch,texts,fl,tl))
+            add_tokens(u.id, cost)
+            await msg.edit_text("❌ *Subtitle পাওয়া যায়নি!*\n\n_Token ফেরত দেওয়া হয়েছে।_",
+                parse_mode='Markdown', reply_markup=kb_back()); return
+        blocks = parse_vtt(content) if content.startswith('WEBVTT') else parse_srt(content)
+        if not blocks:
+            add_tokens(u.id, cost); await msg.edit_text("❌ Parse করা যায়নি!", reply_markup=kb_back()); return
+        total = len(blocks); fl = user.get('from_lang','auto'); tl = user.get('to_lang','bn')
+        translated = list(blocks)
+        for i in range(0, total, 7):
+            chunk = blocks[i:i+7]; texts = [b['text'] for b in chunk]
+            result = await loop.run_in_executor(executor, functools.partial(tbatch,texts,fl,tl))
             for j,tr in enumerate(result):
                 if i+j<total: translated[i+j]['text']=tr
-            try: await msg.edit_text(f"🔄 *অনুবাদ...* {min(i+7,total)/total*100:.0f}%",parse_mode='Markdown')
+            try: await msg.edit_text(f"🔄 *অনুবাদ...* {min(i+7,total)/total*100:.0f}%", parse_mode='Markdown')
             except: pass
             await asyncio.sleep(0.5)
-
-        out_name=f"{title[:30]}_Bengali.srt"; out_bytes=build_srt(translated).encode('utf-8-sig')
-        new_bal=get_tokens(u.id); add_tokens(u.id,3)
+        oname = f"{title[:30]}_Bengali.srt"; out = build_srt(translated).encode('utf-8-sig')
+        new_bal = get_tokens(u.id); add_tokens(u.id, 3)
         await msg.delete()
-        await update.message.reply_document(document=io.BytesIO(out_bytes),filename=out_name,
+        await update.message.reply_document(
+            document=io.BytesIO(out), filename=oname,
             caption=(f"🎬 *YouTube Subtitle অনুবাদ সম্পন্ন!*\n\n📺 `{title}`\n"
                      f"✅ *{total}টি* লাইন | 🪙 -{cost}+3bonus\n💰 Balance: *{new_bal+3}*"),
-            parse_mode='Markdown',reply_markup=kb_home())
-        log_history(u.id,out_name,total,fl,tl,cost); return
+            parse_mode='Markdown', reply_markup=kb_home())
+        log_history(u.id, oname, total, fl, tl, cost); return
 
-    # Search — spell fix + poster
+    # ── YouTube Video Download (Cobalt) ──
+    if state.get('action') in ('yt_download_wait_url', 'yt_download_audio_url'):
+        is_audio = (state.get('action') == 'yt_download_audio_url')
+        if not ('youtube.com' in text or 'youtu.be' in text):
+            await update.message.reply_text("❌ সঠিক YouTube link দাও!"); return
+        user_state.pop(u.id, None)
+        emoji    = "🎵" if is_audio else "🎬"
+        mode_txt = "MP3 Audio" if is_audio else "Video"
+        msg      = await update.message.reply_text(
+            f"⏳ *{emoji} {mode_txt} download link তৈরি হচ্ছে...*\n\nএকটু অপেক্ষা করো...",
+            parse_mode='Markdown')
+        loop = asyncio.get_event_loop()
+        if is_audio:
+            result = await loop.run_in_executor(executor, cobalt_get_audio, text)
+        else:
+            result = await loop.run_in_executor(executor, cobalt_get_link, text, "1080")
+            if not result or not result.get('url'):
+                result = await loop.run_in_executor(executor, cobalt_get_link, text, "720")
+        if not result or not result.get('url'):
+            await msg.edit_text(
+                "❌ *Download link তৈরি করা যায়নি!*\n\n"
+                "সম্ভাব্য কারণ:\n"
+                "• Video age-restricted বা private\n"
+                "• Cobalt server সাময়িকভাবে busy\n\n"
+                "_একটু পরে আবার চেষ্টা করো।_",
+                parse_mode='Markdown', reply_markup=kb_home()); return
+        dl_url = result.get('url',''); fname = result.get('filename', f'video.{"mp3" if is_audio else "mp4"}')
+        await msg.edit_text(
+            f"✅ *{emoji} {mode_txt} Download Link তৈরি হয়েছে!* 🆓\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📁 ফাইল: `{fname}`\n\n"
+            f"🔗 *Download Link:*\n"
+            f"[👆 এখানে ক্লিক করো ডাউনলোড করতে]({dl_url})\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 *ব্যবহার:*\n"
+            f"• উপরের link-এ ক্লিক করো\n"
+            f"• Browser-এ download শুরু হবে ⬇️\n\n"
+            f"⚠️ _Link ৬ ঘণ্টা valid থাকবে_",
+            parse_mode='Markdown',
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"⬇️ {mode_txt} ডাউনলোড করো", url=dl_url)],
+                [InlineKeyboardButton("📥 আরেকটি ডাউনলোড", callback_data="yt_download")],
+                [InlineKeyboardButton("🔙 হোম", callback_data="home")]])); return
+
+    # ── Search ──
     if ctx.user_data.get('awaiting_search'):
-        ctx.user_data['awaiting_search']=False
-        msg=await update.message.reply_text(f"🔍 *খোঁজা হচ্ছে:* `{text}`\n\n✨ বানান চেক করছি...",parse_mode='Markdown')
-        loop=asyncio.get_event_loop()
-
-        # Step 1: Fix movie name
-        fixed_name=await loop.run_in_executor(executor,fix_movie_name,text)
-        if fixed_name.lower()!=text.lower():
-            try: await msg.edit_text(f"🔍 *খোঁজা হচ্ছে:* `{text}`\n\n✅ বানান ঠিক করা হয়েছে: `{fixed_name}`\n⏳ SubDL-এ খুঁজছি...",parse_mode='Markdown')
+        ctx.user_data['awaiting_search'] = False
+        msg  = await update.message.reply_text(
+            f"🔍 *খোঁজা হচ্ছে:* `{text}`\n\n✨ বানান চেক করছি...", parse_mode='Markdown')
+        loop = asyncio.get_event_loop()
+        fixed = await loop.run_in_executor(executor, fix_movie_name, text)
+        if fixed.lower() != text.lower():
+            try: await msg.edit_text(f"🔍 `{text}` → ✅ `{fixed}`\n⏳ খুঁজছি...", parse_mode='Markdown')
             except: pass
-
-        # Step 2: Get movie info + poster
-        movie_info={}; poster_data=None
+        movie_info = {}; poster_data = None
         if OMDB_API_KEY:
-            movie_info=await loop.run_in_executor(executor,get_movie_info,fixed_name)
+            movie_info  = await loop.run_in_executor(executor, get_movie_info, fixed)
             if movie_info.get('Poster') and movie_info['Poster']!='N/A':
-                poster_data=await loop.run_in_executor(executor,download_poster,movie_info['Poster'])
-
-        # Step 3: Search SubDL
-        results=await loop.run_in_executor(executor,subdl_search,fixed_name)
-        if not results and fixed_name!=text:
-            results=await loop.run_in_executor(executor,subdl_search,text)
-
+                poster_data = await loop.run_in_executor(executor, download_poster, movie_info['Poster'])
+        results = await loop.run_in_executor(executor, subdl_search, fixed)
+        if not results and fixed!=text:
+            results = await loop.run_in_executor(executor, subdl_search, text)
         if not results:
-            await msg.edit_text(f"😔 *`{fixed_name}`* এর জন্য কিছু পাওয়া যায়নি!\n\nঅন্যভাবে লিখে চেষ্টা করো।",
+            await msg.edit_text(
+                f"😔 *`{fixed}`* এর জন্য কিছু পাওয়া যায়নি!\n\nঅন্যভাবে লিখে চেষ্টা করো।",
                 parse_mode='Markdown',
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔍 আবার খোঁজো",callback_data="search")],
-                    [InlineKeyboardButton("🔙 হোম",callback_data="home")]])); return
-
-        # Build movie info text
-        info_text=""
+                    [InlineKeyboardButton("🔍 আবার খোঁজো", callback_data="search")],
+                    [InlineKeyboardButton("🔙 হোম",         callback_data="home")]])); return
+        info_text = ""
         if movie_info:
-            t=movie_info.get('Title',''); y=movie_info.get('Year',''); r=movie_info.get('imdbRating','N/A')
-            g=movie_info.get('Genre',''); p=movie_info.get('Plot','')
-            if p and p!='N/A': p=p[:120]+"..."
-            info_text=(f"🎬 *{t}* ({y})\n⭐ IMDb: *{r}* | 🎭 {g}\n📝 _{p}_\n\n" if t else "")
-
-        # Subtitle text
-        if fixed_name.lower()!=text.lower():
-            header=f"🔍 `{text}` → ✅ `{fixed_name}`\n\n"
-        else:
-            header=f"🔍 *`{fixed_name}`* এর Subtitle:\n\n"
-
-        body=header+info_text+"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        buttons=[]
-        for i,item in enumerate(results,1):
-            name=item.get('release_name','Unknown')[:45]; lang=item.get('language','EN')
-            yr=f" ({item.get('year','')})" if item.get('year') else ""
-            ctx.user_data[f"suburl_{i}"]=item.get('url','')
-            ctx.user_data[f"subname_{i}"]=(item.get('release_name',f'subtitle_{i}')+'.srt')[:60]
-            body+=f"*{i}.* {name}{yr} 🌐{lang}\n\n"
-            buttons.append([InlineKeyboardButton(f"⬇️ {i}. {name[:33]}{yr}",callback_data=f"subdl_{i}")])
-        buttons.append([InlineKeyboardButton("🔍 আবার খোঁজো",callback_data="search")])
-        buttons.append([InlineKeyboardButton("🔙 হোম",callback_data="home")])
-        kb=InlineKeyboardMarkup(buttons)
-
-        # Send with poster if available
+            t  = movie_info.get('Title',''); y = movie_info.get('Year','')
+            r  = movie_info.get('imdbRating','N/A'); g = movie_info.get('Genre','')
+            p  = movie_info.get('Plot','')
+            if p and p!='N/A': p = p[:120]+"..."
+            if t: info_text = f"🎬 *{t}* ({y})\n⭐ IMDb: *{r}* | 🎭 {g}\n📝 _{p}_\n\n"
+        header = f"🔍 `{text}` → ✅ `{fixed}`\n\n" if fixed.lower()!=text.lower() else f"🔍 *`{fixed}`* এর Subtitle:\n\n"
+        body = header + info_text + "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        buttons = []
+        for i, item in enumerate(results, 1):
+            name = item.get('release_name','Unknown')[:45]; lang = item.get('language','EN')
+            yr   = f" ({item.get('year','')})" if item.get('year') else ""
+            ctx.user_data[f"suburl_{i}"] = item.get('url','')
+            ctx.user_data[f"subname_{i}"] = (item.get('release_name',f'subtitle_{i}')+'.srt')[:60]
+            body += f"*{i}.* {name}{yr} 🌐{lang}\n\n"
+            buttons.append([InlineKeyboardButton(f"⬇️ {i}. {name[:33]}{yr}", callback_data=f"subdl_{i}")])
+        buttons.append([InlineKeyboardButton("🔍 আবার খোঁজো", callback_data="search")])
+        buttons.append([InlineKeyboardButton("🔙 হোম",         callback_data="home")])
+        kb = InlineKeyboardMarkup(buttons)
         try:
             if poster_data:
                 await msg.delete()
-                await update.message.reply_photo(photo=io.BytesIO(poster_data),caption=body,
-                    parse_mode='Markdown',reply_markup=kb)
+                await update.message.reply_photo(photo=io.BytesIO(poster_data),
+                    caption=body, parse_mode='Markdown', reply_markup=kb)
             else:
-                await msg.edit_text(body,parse_mode='Markdown',reply_markup=kb)
+                await msg.edit_text(body, parse_mode='Markdown', reply_markup=kb)
         except Exception as e:
-            logger.warning(f"Search display error: {e}")
-            try: await msg.edit_text(body,parse_mode='Markdown',reply_markup=kb)
+            logger.warning(f"Search display: {e}")
+            try: await msg.edit_text(body, parse_mode='Markdown', reply_markup=kb)
             except: pass
         return
 
-    # AI Chat
-    if chat_mode.get(u.id,False):
-        cost=COST['chat_per_msg']; bal=get_tokens(u.id)
-        if bal<cost:
-            await update.message.reply_text(token_warn(cost,bal),parse_mode='Markdown',reply_markup=kb_back()); return
-        deduct_tokens(u.id,cost)
-        await ctx.bot.send_chat_action(update.effective_chat.id,"typing")
-        loop=asyncio.get_event_loop(); reply=await loop.run_in_executor(executor,functools.partial(ai_chat,u.id,text))
-        hlen=len(chat_history.get(u.id,[]))//2; new_bal=get_tokens(u.id)
+    # ── Auto-detect YouTube link ──
+    if 'youtube.com' in text or 'youtu.be' in text:
+        ctx.user_data['yt_url_pending'] = text
         await update.message.reply_text(
-            f"{reply}\n\n━━━━━━━━━━━━━━━━━━━━━\n_💬 {hlen} বার্তা | 🪙 Balance: {new_bal}_",
-            parse_mode='Markdown',reply_markup=kb_chat()); return
+            "▶️ *YouTube Link পেয়েছি!*\n\nকী করতে চাও?",
+            parse_mode='Markdown', reply_markup=kb_yt_choice(text)); return
 
-    # Default
+    # ── AI Chat ──
+    if chat_mode.get(u.id, False):
+        cost = COST['chat_per_msg']; bal = get_tokens(u.id)
+        if bal < cost:
+            await update.message.reply_text(token_warn(cost,bal),
+                parse_mode='Markdown', reply_markup=kb_back()); return
+        deduct_tokens(u.id, cost)
+        await ctx.bot.send_chat_action(update.effective_chat.id, "typing")
+        loop  = asyncio.get_event_loop()
+        reply = await loop.run_in_executor(executor, functools.partial(ai_chat, u.id, text))
+        hlen  = len(chat_history.get(u.id,[])) // 2; new_bal = get_tokens(u.id)
+        await update.message.reply_text(
+            f"{reply}\n\n━━━━━━━━━━━━━━━━━━━━━\n"
+            f"_💬 {hlen} বার্তা | 🪙 Balance: {new_bal}_",
+            parse_mode='Markdown', reply_markup=kb_chat()); return
+
+    # ── Default ──
     await update.message.reply_text(
         "📌 *কী করতে চাও?*\n\n"
-        "• SRT/VTT/ASS ফাইল পাঠাও\n• YouTube link পাঠাও\n"
-        "• Voice/Audio পাঠাও\n• বাটন চাপো 👇",
-        parse_mode='Markdown',reply_markup=kb_home())
+        "• SRT/VTT/ASS ফাইল পাঠাও\n"
+        "• YouTube link পাঠাও\n"
+        "• Voice/Audio পাঠাও\n"
+        "• বাটন চাপো 👇",
+        parse_mode='Markdown', reply_markup=kb_home())
 
 # ══════════════════════════════════════════════
 # 🚀  MAIN
 # ══════════════════════════════════════════════
 def main():
-    if not BOT_TOKEN: logger.error("❌ BOT_TOKEN missing!"); return
+    if not BOT_TOKEN:    logger.error("❌ BOT_TOKEN missing!"); return
     if not GROQ_API_KEY: logger.error("❌ GROQ_API_KEY missing!"); return
 
     init_db()
-    threading.Thread(target=run_flask,daemon=True).start()
-    threading.Thread(target=self_ping,daemon=True).start()
+    threading.Thread(target=run_flask, daemon=True).start()
+    threading.Thread(target=self_ping, daemon=True).start()
     logger.info("✅ Flask + self-ping started")
 
-    app=Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("profile", cmd_profile))
-    app.add_handler(CommandHandler("referral",cmd_referral))
-    app.add_handler(CommandHandler("daily",   cmd_daily))
-    app.add_handler(CommandHandler("promo",   cmd_promo))
-    app.add_handler(CommandHandler("admin",   cmd_admin))
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("profile",  cmd_profile))
+    app.add_handler(CommandHandler("referral", cmd_referral))
+    app.add_handler(CommandHandler("daily",    cmd_daily))
+    app.add_handler(CommandHandler("promo",    cmd_promo))
+    app.add_handler(CommandHandler("admin",    cmd_admin))
     app.add_handler(CallbackQueryHandler(cb_handler))
-    app.add_handler(MessageHandler(filters.VOICE,handle_audio_or_voice))
-    app.add_handler(MessageHandler(filters.AUDIO,handle_audio_or_voice))
-    app.add_handler(MessageHandler(filters.Document.ALL,handle_file))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_text))
+    app.add_handler(MessageHandler(filters.VOICE,         handle_audio_or_voice))
+    app.add_handler(MessageHandler(filters.AUDIO,         handle_audio_or_voice))
+    app.add_handler(MessageHandler(filters.Document.ALL,  handle_file))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("🤖 Bot polling started!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=True,
-                    read_timeout=30,write_timeout=30,connect_timeout=30,pool_timeout=30)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        read_timeout=30, write_timeout=30,
+        connect_timeout=30, pool_timeout=30)
 
 if __name__ == '__main__':
     main()
