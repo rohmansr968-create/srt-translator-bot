@@ -799,7 +799,10 @@ def create_pdf_from_images(
         except Exception:
             continue
 
-    return pdf.output(dest='S').encode('latin-1')
+    result = pdf.output()
+    if isinstance(result, bytes):
+        return result
+    return result.encode('latin-1')
 
 # ══════════════════════════════════════════════
 # 🔍  SUBDL
