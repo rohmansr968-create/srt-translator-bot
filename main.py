@@ -800,8 +800,11 @@ def create_pdf_from_images(
             continue
 
     result = pdf.output()
-    if isinstance(result, bytes):
-        return result
+    # fpdf2 version অনুযায়ী output type আলাদা:
+    # purano: str → encode করো
+    # নতুন: bytes বা bytearray → সরাসরি bytes() করো
+    if isinstance(result, (bytes, bytearray)):
+        return bytes(result)
     return result.encode('latin-1')
 
 # ══════════════════════════════════════════════
