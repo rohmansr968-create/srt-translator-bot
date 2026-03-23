@@ -689,25 +689,51 @@ def download_poster(url: str):
 # 🖼️  IMAGE SEARCH + PDF CREATOR
 # ══════════════════════════════════════════════
 def search_images(query: str, count: int) -> list:
-    """DuckDuckGo দিয়ে ছবির URL খোঁজো"""
+    """DuckDuckGo দিয়ে ছবির URL খোঁজো — নতুন API"""
     if not DDG_AVAILABLE:
         return []
     urls = []
+    want = min(count * 3, 60)
     try:
-        with DDGS() as ddgs:
-            results = ddgs.images(
-                query,
-                max_results=min(count * 3, 60),   # extra নাও, কিছু fail হতে পারে
-                safesearch='moderate',
-            )
-            for r in results:
-                url = r.get('image','') or r.get('url','')
-                if url and url.startswith('http'):
-                    urls.append(url)
-                if len(urls) >= count * 2:
-                    break
+        # নতুন API: DDGS().images(query, max_results=N)
+        results = DDGS().images(
+            query,
+            max_results=want,
+            safesearch='moderate',
+        )
+        for r in results:
+            # নতুন version-এ key হলো 'image', পুরনোতে 'url'
+            url = r.get('image') or r.get('thumbnail') or r.get('url','')
+            if url and url.startswith('http'):
+                urls.append(url)
+            if len(urls) >= count * 2:
+                break
     except Exception as e:
-        logging.getLogger(__name__).error(f"DDG image search: {e}")
+        logging.getLogger(__name__).error(f"DDG image search error: {e}")
+        # Fallback: Google Images scrape via requests
+        try:
+            headers = {
+                'User-Agent': (
+                    'Mozilla/5.0 (Linux; Android 10) '
+                    'AppleWebKit/537.36 Chrome/120.0 Safari/537.36'
+                )
+            }
+            params = {
+                'q': query,
+                'tbm': 'isch',
+                'ijn': '0',
+            }
+            r2 = requests.get(
+                'https://www.google.com/search',
+                params=params, headers=headers, timeout=15
+            )
+            # Extract image URLs from response
+            found = re.findall(r'\"(https?://[^\"]+\.(?:jpg|jpeg|png|webp))\"', r2.text)
+            for u in found:
+                if u not in urls and len(urls) < count * 2:
+                    urls.append(u)
+        except Exception as e2:
+            logging.getLogger(__name__).error(f"Google fallback error: {e2}")
     return urls
 
 
