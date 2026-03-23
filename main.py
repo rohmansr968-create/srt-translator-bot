@@ -1920,8 +1920,16 @@ async def handle_audio_or_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # 💬  TEXT HANDLER
 # ══════════════════════════════════════════════
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u     = update.effective_user
-    text  = update.message.text.strip()
+    u    = update.effective_user
+    msg  = update.message
+    if not msg or not msg.text: return
+    text = msg.text.strip()
+
+    # Group/Supergroup হলে group handler-এ পাঠাও, এখানে কিছু করো না
+    if msg.chat.type in ('group', 'supergroup'):
+        await handle_group_message(update, ctx)
+        return
+
     if not await check_access(u.id, ctx.bot, update.message.reply_text): return
     user  = get_user(u.id, u.username, u.first_name)
     state = user_state.get(u.id, {})
@@ -2281,17 +2289,18 @@ def group_ai_reply_sync(user_name: str, text: str) -> str:
 # 🤖  GROUP MESSAGE HANDLER
 # ══════════════════════════════════════════════
 async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """গ্রুপের সব মেসেজ handle করো"""
-    msg     = update.message
+    """গ্রুপের সব মেসেজ handle করো — NO channel check, NO private bot buttons"""
+    msg  = update.message
     if not msg or not msg.text:
         return
 
     chat_id = msg.chat_id
     user    = msg.from_user
-    text    = msg.text.strip()
+    if not user or user.is_bot:
+        return
 
-    # Bot-এর নিজের মেসেজ ignore করো
-    if user.is_bot:
+    text = msg.text.strip()
+    if not text:
         return
 
     loop = asyncio.get_event_loop()
@@ -2310,14 +2319,8 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         warn_msg = await ctx.bot.send_message(
             chat_id,
-            f"⚠️ [{user.first_name}](tg://user?id={user.id}) "
-            (
-                f"⚠️ [{user.first_name}](tg://user?id={user.id}) "
-                f"তোমার মেসেজটি অনুপযুক্ত ছিল এবং মুছে দেওয়া হয়েছে।\n"
-                f"সতর্কতা: *{warn_count}/3*"
-            ),
-            f"সতর্কতা: *{warn_count}/3*",
-            parse_mode='Markdown'
+            f"⚠️ {user.first_name} তোমার মেসেজটি অনুপযুক্ত — মুছে দেওয়া হয়েছে।"
+            f" সতর্কতা: {warn_count}/3",
         )
 
         # 3 বার warn হলে kick করো
@@ -2326,9 +2329,7 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await ctx.bot.ban_chat_member(chat_id, user.id)
                 await ctx.bot.send_message(
                     chat_id,
-                    f"🚫 [{user.first_name}](tg://user?id={user.id}) "
-                    f"৩ বার সতর্কতার পরে গ্রুপ থেকে বের করা হয়েছে।",
-                    parse_mode='Markdown'
+                    f"🚫 {user.first_name} (ID:{user.id}) — ৩ বার সতর্কতার পরে গ্রুপ থেকে বের করা হয়েছে."
                 )
                 group_warns.pop(key, None)
             except Exception as e:
@@ -2357,12 +2358,9 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if reply_text:
         try:
-            await msg.reply_text(reply_text, parse_mode='Markdown')
-        except Exception:
-            try:
-                await msg.reply_text(reply_text)
-            except Exception as e:
-                logger.warning(f"Group reply failed: {e}")
+            await msg.reply_text(reply_text)
+        except Exception as e:
+            logger.warning(f"Group reply failed: {e}")
 
 
 # ── Group Commands ──
@@ -2476,16 +2474,22 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE,         handle_audio_or_voice))
     app.add_handler(MessageHandler(filters.AUDIO,         handle_audio_or_voice))
     app.add_handler(MessageHandler(filters.Document.ALL,  handle_file))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    # ── Group handlers ──
+    # ── Group commands ──
     app.add_handler(CommandHandler("aion",       cmd_groupai_on))
     app.add_handler(CommandHandler("aioff",      cmd_groupai_off))
     app.add_handler(CommandHandler("warns",      cmd_warns))
     app.add_handler(CommandHandler("clearwarns", cmd_clearwarns))
-    # Group-এর সব text message handle করো (private ছাড়া)
+
+    # ── Private text (channel check, AI chat etc.) ──
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        handle_text
+    ))
+
+    # ── Group text — obscene check + AI reply ──
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND &
+        (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
         handle_group_message
     ))
 
