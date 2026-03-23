@@ -98,6 +98,8 @@ chat_history  = {}
 pending_audio = {}
 user_state    = {}
 image_tasks   = {}   # {uid: cancel_flag}
+group_ai_on   = set()   # chat_ids where group AI is enabled
+group_warns   = {}       # {(chat_id, uid): count}
 
 # ══════════════════════════════════════════════
 # 🗄️  DATABASE
@@ -2218,6 +2220,235 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• বাটন চাপো 👇",
         parse_mode='Markdown', reply_markup=kb_home())
 
+
+# ══════════════════════════════════════════════
+# 🤖  GROUP AI FUNCTIONS
+# ══════════════════════════════════════════════
+GROUP_AI_SYSTEM = (
+    "তুমি একটি গ্রুপ চ্যাটের AI সহকারী। "
+    "বাংলায় সহজ ও বন্ধুত্বপূর্ণভাবে উত্তর দাও। "
+    "সংক্ষিপ্ত কিন্তু সহায়ক উত্তর দাও। "
+    "প্রয়োজনে English ব্যবহার করতে পারো।"
+)
+
+OBSCENE_SYSTEM = (
+    "You are a content moderator. "
+    "Analyze the given message and determine if it contains: "
+    "sexual content, extreme profanity, hate speech, harassment, or explicit material. "
+    "Reply with ONLY: CLEAN or OBSCENE "
+    "Nothing else."
+)
+
+def is_obscene_sync(text: str) -> bool:
+    """Groq AI দিয়ে অশ্লীল মেসেজ detect করো"""
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": OBSCENE_SYSTEM},
+                {"role": "user",   "content": f"Message: {text[:500]}"}
+            ],
+            temperature=0.0,
+            max_tokens=10
+        )
+        result = resp.choices[0].message.content.strip().upper()
+        return "OBSCENE" in result
+    except Exception as e:
+        logger.error(f"Obscene check error: {e}")
+        return False
+
+
+def group_ai_reply_sync(user_name: str, text: str) -> str:
+    """গ্রুপ মেসেজের AI reply তৈরি করো"""
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": GROUP_AI_SYSTEM},
+                {"role": "user",   "content": f"{user_name} বলেছে: {text}"}
+            ],
+            temperature=0.7,
+            max_tokens=512
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        if _iq(e):
+            return "⚠️ API limit শেষ।"
+        return ""
+
+
+# ══════════════════════════════════════════════
+# 🤖  GROUP MESSAGE HANDLER
+# ══════════════════════════════════════════════
+async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """গ্রুপের সব মেসেজ handle করো"""
+    msg     = update.message
+    if not msg or not msg.text:
+        return
+
+    chat_id = msg.chat_id
+    user    = msg.from_user
+    text    = msg.text.strip()
+
+    # Bot-এর নিজের মেসেজ ignore করো
+    if user.is_bot:
+        return
+
+    loop = asyncio.get_event_loop()
+
+    # ── Step 1: Obscene check ──
+    is_bad = await loop.run_in_executor(executor, is_obscene_sync, text)
+    if is_bad:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        # Warn the user
+        key = (chat_id, user.id)
+        group_warns[key] = group_warns.get(key, 0) + 1
+        warn_count = group_warns[key]
+
+        warn_msg = await ctx.bot.send_message(
+            chat_id,
+            f"⚠️ [{user.first_name}](tg://user?id={user.id}) "
+            (
+                f"⚠️ [{user.first_name}](tg://user?id={user.id}) "
+                f"তোমার মেসেজটি অনুপযুক্ত ছিল এবং মুছে দেওয়া হয়েছে।\n"
+                f"সতর্কতা: *{warn_count}/3*"
+            ),
+            f"সতর্কতা: *{warn_count}/3*",
+            parse_mode='Markdown'
+        )
+
+        # 3 বার warn হলে kick করো
+        if warn_count >= 3:
+            try:
+                await ctx.bot.ban_chat_member(chat_id, user.id)
+                await ctx.bot.send_message(
+                    chat_id,
+                    f"🚫 [{user.first_name}](tg://user?id={user.id}) "
+                    f"৩ বার সতর্কতার পরে গ্রুপ থেকে বের করা হয়েছে।",
+                    parse_mode='Markdown'
+                )
+                group_warns.pop(key, None)
+            except Exception as e:
+                logger.warning(f"Kick failed: {e}")
+
+        # Warning message ৩০ সেকেন্ড পর মুছে দাও
+        await asyncio.sleep(30)
+        try:
+            await warn_msg.delete()
+        except Exception:
+            pass
+        return
+
+    # ── Step 2: AI reply (if group AI is enabled) ──
+    if chat_id not in group_ai_on:
+        return
+
+    # Typing indicator
+    await ctx.bot.send_chat_action(chat_id, "typing")
+
+    user_name = user.first_name or user.username or "কেউ"
+    reply_text = await loop.run_in_executor(
+        executor,
+        functools.partial(group_ai_reply_sync, user_name, text)
+    )
+
+    if reply_text:
+        try:
+            await msg.reply_text(reply_text, parse_mode='Markdown')
+        except Exception:
+            try:
+                await msg.reply_text(reply_text)
+            except Exception as e:
+                logger.warning(f"Group reply failed: {e}")
+
+
+# ── Group Commands ──
+async def cmd_groupai_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/aion — গ্রুপে AI চালু করো (Admin only)"""
+    msg = update.message
+    if not msg: return
+    chat_id = msg.chat_id
+
+    # Admin check
+    try:
+        member = await ctx.bot.get_chat_member(chat_id, msg.from_user.id)
+        if member.status not in ('administrator', 'creator'):
+            await msg.reply_text("❌ শুধু Admin এই command দিতে পারবে!")
+            return
+    except Exception:
+        return
+
+    group_ai_on.add(chat_id)
+    await msg.reply_text(
+        "✅ *গ্রুপ AI চালু হয়েছে!*\n\n"
+        "এখন থেকে সব মেসেজের AI reply আসবে।\n"
+        "বন্ধ করতে: /aioff",
+        parse_mode='Markdown'
+    )
+
+
+async def cmd_groupai_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/aioff — গ্রুপে AI বন্ধ করো (Admin only)"""
+    msg = update.message
+    if not msg: return
+    chat_id = msg.chat_id
+
+    try:
+        member = await ctx.bot.get_chat_member(chat_id, msg.from_user.id)
+        if member.status not in ('administrator', 'creator'):
+            await msg.reply_text("❌ শুধু Admin এই command দিতে পারবে!")
+            return
+    except Exception:
+        return
+
+    group_ai_on.discard(chat_id)
+    await msg.reply_text(
+        "🔕 *গ্রুপ AI বন্ধ হয়েছে।*\n\n"
+        "শুধু অশ্লীল মেসেজ ডিলিট হবে।\n"
+        "চালু করতে: /aion",
+        parse_mode='Markdown'
+    )
+
+
+async def cmd_warns(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/warns — কার কতটা warn আছে দেখো"""
+    msg = update.message
+    if not msg: return
+    chat_id = msg.chat_id
+
+    chat_warns = {k: v for k, v in group_warns.items() if k[0] == chat_id}
+    if not chat_warns:
+        await msg.reply_text("✅ এই গ্রুপে কারো warn নেই।")
+        return
+
+    text = "⚠️ *Warn তালিকা:*\n\n"
+    for (cid, uid), count in chat_warns.items():
+        text += f"• User `{uid}`: *{count}/3*\n"
+    await msg.reply_text(text, parse_mode='Markdown')
+
+
+async def cmd_clearwarns(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/clearwarns — সব warn মুছো (Admin only)"""
+    msg = update.message
+    if not msg: return
+    chat_id = msg.chat_id
+
+    try:
+        member = await ctx.bot.get_chat_member(chat_id, msg.from_user.id)
+        if member.status not in ('administrator', 'creator'):
+            await msg.reply_text("❌ শুধু Admin পারবে!"); return
+    except Exception:
+        return
+
+    keys = [k for k in group_warns if k[0] == chat_id]
+    for k in keys:
+        group_warns.pop(k, None)
+    await msg.reply_text(f"✅ *{len(keys)} জনের warn মুছে দেওয়া হয়েছে।*",
+                         parse_mode='Markdown')
+
 # ══════════════════════════════════════════════
 # 🚀  MAIN
 # ══════════════════════════════════════════════
@@ -2246,6 +2477,17 @@ def main():
     app.add_handler(MessageHandler(filters.AUDIO,         handle_audio_or_voice))
     app.add_handler(MessageHandler(filters.Document.ALL,  handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # ── Group handlers ──
+    app.add_handler(CommandHandler("aion",       cmd_groupai_on))
+    app.add_handler(CommandHandler("aioff",      cmd_groupai_off))
+    app.add_handler(CommandHandler("warns",      cmd_warns))
+    app.add_handler(CommandHandler("clearwarns", cmd_clearwarns))
+    # Group-এর সব text message handle করো (private ছাড়া)
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
+        handle_group_message
+    ))
 
     logger.info("🤖 Bot polling started!")
     app.run_polling(
