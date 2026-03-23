@@ -29,11 +29,7 @@ try:
 except ImportError:
     YT_AVAILABLE = False
 
-try:
-    from duckduckgo_search import DDGS
-    DDG_AVAILABLE = True
-except ImportError:
-    DDG_AVAILABLE = False
+PIXABAY_API_KEY = os.environ.get('PIXABAY_API_KEY', '')
 
 try:
     from fpdf import FPDF
@@ -689,51 +685,36 @@ def download_poster(url: str):
 # 🖼️  IMAGE SEARCH + PDF CREATOR
 # ══════════════════════════════════════════════
 def search_images(query: str, count: int) -> list:
-    """DuckDuckGo দিয়ে ছবির URL খোঁজো — নতুন API"""
-    if not DDG_AVAILABLE:
+    """Pixabay API দিয়ে ছবির URL খোঁজো"""
+    if not PIXABAY_API_KEY:
+        logger.warning("PIXABAY_API_KEY not set")
         return []
     urls = []
-    want = min(count * 3, 60)
     try:
-        # নতুন API: DDGS().images(query, max_results=N)
-        results = DDGS().images(
-            query,
-            max_results=want,
-            safesearch='moderate',
+        r = requests.get(
+            "https://pixabay.com/api/",
+            params={
+                "key":        PIXABAY_API_KEY,
+                "q":          query,
+                "image_type": "photo",
+                "per_page":   min(count * 2, 40),
+                "safesearch": "true",
+                "order":      "popular",
+            },
+            timeout=15
         )
-        for r in results:
-            # নতুন version-এ key হলো 'image', পুরনোতে 'url'
-            url = r.get('image') or r.get('thumbnail') or r.get('url','')
-            if url and url.startswith('http'):
-                urls.append(url)
-            if len(urls) >= count * 2:
-                break
+        if r.status_code == 200:
+            hits = r.json().get("hits", [])
+            for h in hits:
+                url = h.get("largeImageURL") or h.get("webformatURL", "")
+                if url:
+                    urls.append(url)
+                if len(urls) >= count * 2:
+                    break
+        else:
+            logger.error(f"Pixabay API error: {r.status_code} {r.text[:100]}")
     except Exception as e:
-        logging.getLogger(__name__).error(f"DDG image search error: {e}")
-        # Fallback: Google Images scrape via requests
-        try:
-            headers = {
-                'User-Agent': (
-                    'Mozilla/5.0 (Linux; Android 10) '
-                    'AppleWebKit/537.36 Chrome/120.0 Safari/537.36'
-                )
-            }
-            params = {
-                'q': query,
-                'tbm': 'isch',
-                'ijn': '0',
-            }
-            r2 = requests.get(
-                'https://www.google.com/search',
-                params=params, headers=headers, timeout=15
-            )
-            # Extract image URLs from response
-            found = re.findall(r'\"(https?://[^\"]+\.(?:jpg|jpeg|png|webp))\"', r2.text)
-            for u in found:
-                if u not in urls and len(urls) < count * 2:
-                    urls.append(u)
-        except Exception as e2:
-            logging.getLogger(__name__).error(f"Google fallback error: {e2}")
+        logger.error(f"Pixabay search error: {e}")
     return urls
 
 
@@ -1565,9 +1546,9 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── Image PDF ──
     if d == "img_pdf":
-        if not DDG_AVAILABLE:
+        if not PIXABAY_API_KEY:
             await q.edit_message_text(
-                "❌ *Image Search চালু নেই!*\n\n`duckduckgo-search` install নেই।",
+                "❌ *Image Search চালু নেই!*\n\nRender-এ `PIXABAY_API_KEY` set করো।",
                 parse_mode='Markdown', reply_markup=kb_back())
             return
         if not FPDF_AVAILABLE:
