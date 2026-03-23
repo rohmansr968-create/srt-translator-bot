@@ -799,13 +799,18 @@ def create_pdf_from_images(
         except Exception:
             continue
 
-    result = pdf.output()
-    # fpdf2 version অনুযায়ী output type আলাদা:
-    # purano: str → encode করো
-    # নতুন: bytes বা bytearray → সরাসরি bytes() করো
-    if isinstance(result, (bytes, bytearray)):
-        return bytes(result)
-    return result.encode('latin-1')
+    # BytesIO buffer-এ লেখো — সব fpdf2 version-এ কাজ করে
+    # output() এর return type নিয়ে কোনো সমস্যা নেই
+    output_buf = io.BytesIO()
+    try:
+        pdf.output(output_buf)          # fpdf2 2.x: BytesIO-তে লেখে
+        return output_buf.getvalue()    # সবসময় bytes দেয়
+    except Exception:
+        # Fallback: পুরনো পদ্ধতি
+        raw = pdf.output()
+        if isinstance(raw, (bytes, bytearray)):
+            return bytes(raw)
+        return raw.encode('latin-1')
 
 # ══════════════════════════════════════════════
 # 🔍  SUBDL
