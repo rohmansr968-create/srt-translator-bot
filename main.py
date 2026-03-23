@@ -2364,19 +2364,29 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Group Commands ──
+async def is_group_admin(chat_id: int, user_id: int, bot) -> bool:
+    """ইউজার গ্রুপের admin কিনা চেক করো"""
+    # Bot owner সবসময় পারবে
+    if user_id in ADMIN_IDS:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        logger.info(f"Member status for {user_id} in {chat_id}: {member.status}")
+        return member.status in ('administrator', 'creator')
+    except Exception as e:
+        logger.warning(f"Admin check failed for {user_id}: {e}")
+        # Check fail হলে allow করো (better UX)
+        return True
+
+
 async def cmd_groupai_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/aion — গ্রুপে AI চালু করো (Admin only)"""
     msg = update.message
     if not msg: return
     chat_id = msg.chat_id
 
-    # Admin check
-    try:
-        member = await ctx.bot.get_chat_member(chat_id, msg.from_user.id)
-        if member.status not in ('administrator', 'creator'):
-            await msg.reply_text("❌ শুধু Admin এই command দিতে পারবে!")
-            return
-    except Exception:
+    if not await is_group_admin(chat_id, msg.from_user.id, ctx.bot):
+        await msg.reply_text("❌ শুধু Admin এই command দিতে পারবে!")
         return
 
     group_ai_on.add(chat_id)
@@ -2394,12 +2404,8 @@ async def cmd_groupai_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not msg: return
     chat_id = msg.chat_id
 
-    try:
-        member = await ctx.bot.get_chat_member(chat_id, msg.from_user.id)
-        if member.status not in ('administrator', 'creator'):
-            await msg.reply_text("❌ শুধু Admin এই command দিতে পারবে!")
-            return
-    except Exception:
+    if not await is_group_admin(chat_id, msg.from_user.id, ctx.bot):
+        await msg.reply_text("❌ শুধু Admin এই command দিতে পারবে!")
         return
 
     group_ai_on.discard(chat_id)
@@ -2434,12 +2440,8 @@ async def cmd_clearwarns(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not msg: return
     chat_id = msg.chat_id
 
-    try:
-        member = await ctx.bot.get_chat_member(chat_id, msg.from_user.id)
-        if member.status not in ('administrator', 'creator'):
-            await msg.reply_text("❌ শুধু Admin পারবে!"); return
-    except Exception:
-        return
+    if not await is_group_admin(chat_id, msg.from_user.id, ctx.bot):
+        await msg.reply_text("❌ শুধু Admin পারবে!"); return
 
     keys = [k for k in group_warns if k[0] == chat_id]
     for k in keys:
