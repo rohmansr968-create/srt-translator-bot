@@ -76,17 +76,13 @@ AUDIO_EXTS  = ('.mp3','.mp4','.wav','.m4a','.ogg','.webm','.oga','.flac')
 MAX_AUDIO   = 25*1024*1024
 DB_PATH     = '/tmp/subtitle_bot.db'
 
-COBALT_INSTANCES = [
-    "https://api.cobalt.tools",
-    "https://cobalt.api.timelessnesses.me",
-    "https://cobalt.yt",
-]
+MAX_VIDEO_SIZE  = 50 * 1024 * 1024   # 50MB Telegram limit
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 groq_client   = Groq(api_key=GROQ_API_KEY)
-executor      = ThreadPoolExecutor(max_workers=4)
+executor      = ThreadPoolExecutor(max_workers=8)
 active_tasks  = {}
 cancel_events = {}
 chat_mode     = {}
@@ -501,44 +497,117 @@ def trans_plain(text, tl='bn'):
         raise e
 
 # ══════════════════════════════════════════════
-# 📥  COBALT — YouTube Video/Audio Download
+# 📥  yt-dlp দিয়ে YouTube Video/Audio Download
 # ══════════════════════════════════════════════
-def cobalt_get_link(yt_url: str, quality: str = "1080") -> dict:
-    """Cobalt API দিয়ে YouTube video direct download link নাও"""
-    headers = {"Accept":"application/json","Content-Type":"application/json"}
-    payload = {"url":yt_url,"videoQuality":quality,"filenameStyle":"pretty","downloadMode":"auto"}
-    for instance in COBALT_INSTANCES:
-        try:
-            r = requests.post(f"{instance}/", json=payload, headers=headers, timeout=15)
-            if r.status_code == 200:
-                data = r.json(); status = data.get("status","")
-                if status in ("tunnel","redirect"):
-                    return {"url":data.get("url",""),"filename":data.get("filename","video.mp4"),"type":"video"}
-                elif status == "picker":
-                    items = data.get("picker",[])
-                    if items:
-                        return {"url":items[0].get("url",""),"filename":data.get("filename","video.mp4"),
-                                "type":"video","picker":items}
-                elif status == "error":
-                    logger.warning(f"Cobalt {instance}: {data.get('error','')}")
-        except Exception as e:
-            logger.warning(f"Cobalt {instance}: {e}")
-    return {}
+def yt_download_video(yt_url: str, quality: str = "720") -> dict:
+    """
+    yt-dlp দিয়ে video download করো।
+    Returns: {'data': bytes, 'filename': str, 'size': int, 'title': str}
+    """
+    if not YT_AVAILABLE:
+        return {'error': 'yt-dlp install নেই।'}
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_tmpl = os.path.join(tmpdir, '%(title).40s.%(ext)s')
+            ydl_opts = {
+                'format': (
+                    f'bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]'
+                    f'/best[height<={quality}][ext=mp4]'
+                    f'/best[height<={quality}]'
+                    f'/best'
+                ),
+                'outtmpl':        out_tmpl,
+                'quiet':          True,
+                'no_warnings':    True,
+                'noplaylist':     True,
+                'merge_output_format': 'mp4',
+                'max_filesize':   MAX_VIDEO_SIZE,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(yt_url, download=True)
+                title = info.get('title', 'video')[:50]
 
-def cobalt_get_audio(yt_url: str) -> dict:
-    """Cobalt API দিয়ে MP3 download link নাও"""
-    headers = {"Accept":"application/json","Content-Type":"application/json"}
-    payload = {"url":yt_url,"downloadMode":"audio","audioFormat":"mp3","filenameStyle":"pretty"}
-    for instance in COBALT_INSTANCES:
-        try:
-            r = requests.post(f"{instance}/", json=payload, headers=headers, timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("status") in ("tunnel","redirect"):
-                    return {"url":data.get("url",""),"filename":data.get("filename","audio.mp3"),"type":"audio"}
-        except Exception as e:
-            logger.warning(f"Cobalt audio {instance}: {e}")
-    return {}
+            # ডাউনলোড হওয়া ফাইল খোঁজো
+            for fname in os.listdir(tmpdir):
+                fpath = os.path.join(tmpdir, fname)
+                fsize = os.path.getsize(fpath)
+                if fsize > MAX_VIDEO_SIZE:
+                    return {'error': f'ফাইল সাইজ {fsize//(1024*1024)}MB — 50MB-এর বেশি!'}
+                with open(fpath, 'rb') as f:
+                    data = f.read()
+                return {
+                    'data':     data,
+                    'filename': fname,
+                    'size':     fsize,
+                    'title':    title,
+                }
+    except Exception as e:
+        err = str(e)
+        if 'filesize' in err.lower() or 'too large' in err.lower():
+            return {'error': 'ফাইল সাইজ 50MB-এর বেশি! ছোট ভিডিও দাও।'}
+        logger.error(f"yt-dlp video error: {e}")
+        return {'error': f'Download failed: {str(e)[:100]}'}
+    return {'error': 'কোনো ফাইল পাওয়া যায়নি।'}
+
+
+def yt_download_audio(yt_url: str) -> dict:
+    """
+    yt-dlp দিয়ে audio (MP3) download করো।
+    Returns: {'data': bytes, 'filename': str, 'size': int, 'title': str}
+    """
+    if not YT_AVAILABLE:
+        return {'error': 'yt-dlp install নেই।'}
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_tmpl = os.path.join(tmpdir, '%(title).40s.%(ext)s')
+            ydl_opts = {
+                'format':         'bestaudio/best',
+                'outtmpl':        out_tmpl,
+                'quiet':          True,
+                'no_warnings':    True,
+                'noplaylist':     True,
+                'postprocessors': [{
+                    'key':            'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+                'max_filesize':   MAX_VIDEO_SIZE,
+            }
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(yt_url, download=True)
+                    title = info.get('title', 'audio')[:50]
+            except Exception:
+                # FFmpeg নেই হলে raw audio নাও
+                ydl_opts2 = {
+                    'format':      'bestaudio/best',
+                    'outtmpl':     out_tmpl,
+                    'quiet':       True,
+                    'no_warnings': True,
+                    'noplaylist':  True,
+                    'max_filesize': MAX_VIDEO_SIZE,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts2) as ydl:
+                    info = ydl.extract_info(yt_url, download=True)
+                    title = info.get('title', 'audio')[:50]
+
+            for fname in os.listdir(tmpdir):
+                fpath = os.path.join(tmpdir, fname)
+                fsize = os.path.getsize(fpath)
+                if fsize > MAX_VIDEO_SIZE:
+                    return {'error': f'ফাইল সাইজ {fsize//(1024*1024)}MB — 50MB-এর বেশি!'}
+                with open(fpath, 'rb') as f:
+                    data = f.read()
+                return {
+                    'data':     data,
+                    'filename': fname,
+                    'size':     fsize,
+                    'title':    title,
+                }
+    except Exception as e:
+        logger.error(f"yt-dlp audio error: {e}")
+        return {'error': f'Download failed: {str(e)[:100]}'}
+    return {'error': 'কোনো ফাইল পাওয়া যায়নি।'}
 
 # ══════════════════════════════════════════════
 # ▶️  YOUTUBE SUBTITLE
@@ -708,40 +777,42 @@ def kb_not_joined():
 
 def kb_home():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📖 ব্যবহার বিধি",  callback_data="help"),
-         InlineKeyboardButton("👤 প্রোফাইল",       callback_data="profile")],
-        [InlineKeyboardButton("🌐 ভাষা সেটিং",     callback_data="lang_menu"),
-         InlineKeyboardButton("🪙 Token দেখো",     callback_data="token_info")],
-        [InlineKeyboardButton("🔍 Subtitle খোঁজো", callback_data="search"),
-         InlineKeyboardButton("▶️ YT Subtitle",    callback_data="yt_info")],
-        [InlineKeyboardButton("📥 YouTube ডাউনলোড 🆓", callback_data="yt_download")],
-        [InlineKeyboardButton("🛠 Subtitle Tools",  callback_data="tools_menu")],
-        [InlineKeyboardButton("🎙 Audio Transcription", callback_data="audio_info")],
-        [InlineKeyboardButton("💬 AI চ্যাট",        callback_data="chat_start"),
-         InlineKeyboardButton("🎁 Daily Token",     callback_data="daily")]])
+        [InlineKeyboardButton("👤  প্রোফাইল",       callback_data="profile"),
+         InlineKeyboardButton("📖  সাহায্য",         callback_data="help")],
+        [InlineKeyboardButton("🪙  Token দেখো",     callback_data="token_info"),
+         InlineKeyboardButton("🤝  Refer & Earn",   callback_data="refer")],
+        [InlineKeyboardButton("🎁  Daily Token",    callback_data="daily"),
+         InlineKeyboardButton("🌐  ভাষা সেটিং",     callback_data="lang_menu")],
+        [InlineKeyboardButton("▬▬▬▬▬  Features  ▬▬▬▬▬", callback_data="noop")],
+        [InlineKeyboardButton("🔍  Subtitle খোঁজো", callback_data="search")],
+        [InlineKeyboardButton("📥  YouTube ডাউনলোড  🆓", callback_data="yt_download")],
+        [InlineKeyboardButton("🛠  Subtitle Tools", callback_data="tools_menu"),
+         InlineKeyboardButton("🎙  Audio → Text",   callback_data="audio_info")],
+        [InlineKeyboardButton("💬  AI-এর সাথে কথা বলো  🤖", callback_data="chat_start")],
+    ])
 
 def kb_back():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 হোম", callback_data="home")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙  হোম", callback_data="home")]])
 
 def kb_cancel(uid):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল করো", callback_data=f"cancel_{uid}")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⛔  অনুবাদ বাতিল করো", callback_data=f"cancel_{uid}")]])
 
 def kb_chat():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🗑 মুছো",  callback_data="chat_clear")],
-        [InlineKeyboardButton("🔙 বন্ধ", callback_data="chat_stop")]])
+        [InlineKeyboardButton("🗑  কথোপকথন মুছো",  callback_data="chat_clear"),
+         InlineKeyboardButton("🔙  চ্যাট বন্ধ করো", callback_data="chat_stop")]])
 
 def kb_quota():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔑 Groq Console", url="https://console.groq.com")],
-        [InlineKeyboardButton("🔙 হোম", callback_data="home")]])
+        [InlineKeyboardButton("🔑  Groq Console খোলো", url="https://console.groq.com")],
+        [InlineKeyboardButton("🔙  হোম",                callback_data="home")]])
 
 def kb_audio(uid):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🇧🇩 বাংলায় ({COST['audio_transcribe']}🪙)",  callback_data=f"tr_bn_{uid}")],
-        [InlineKeyboardButton(f"🇺🇸 English ({COST['audio_transcribe']}🪙)",  callback_data=f"tr_en_{uid}")],
-        [InlineKeyboardButton(f"🔄 + অনুবাদ ({COST['audio_translate']}🪙)",  callback_data=f"tr_translate_{uid}")],
-        [InlineKeyboardButton("❌ বাতিল", callback_data="home")]])
+        [InlineKeyboardButton(f"🇧🇩  বাংলায় Transcription  ({COST['audio_transcribe']}🪙)", callback_data=f"tr_bn_{uid}")],
+        [InlineKeyboardButton(f"🇺🇸  English Transcription  ({COST['audio_transcribe']}🪙)", callback_data=f"tr_en_{uid}")],
+        [InlineKeyboardButton(f"🔄  Transcription + অনুবাদ  ({COST['audio_translate']}🪙)", callback_data=f"tr_translate_{uid}")],
+        [InlineKeyboardButton("🔙  হোম", callback_data="home")]])
 
 def kb_src_lang():
     rows = []
@@ -761,26 +832,26 @@ def kb_dst_lang():
 
 def kb_tools():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏱ Timing Fix", callback_data="tool_timing")],
-        [InlineKeyboardButton("🔀 Merge",     callback_data="tool_merge")],
-        [InlineKeyboardButton("🔙 হোম",        callback_data="home")]])
+        [InlineKeyboardButton("⏱  Timing Fix — সময় ঠিক করো", callback_data="tool_timing")],
+        [InlineKeyboardButton("🔀  Merge — দুটো ফাইল এক করো", callback_data="tool_merge")],
+        [InlineKeyboardButton("🔙  হোম",                        callback_data="home")]])
 
 def kb_admin():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Statistics",  callback_data="adm_stats"),
-         InlineKeyboardButton("📢 Broadcast",   callback_data="adm_broadcast")],
-        [InlineKeyboardButton("👤 User Lookup", callback_data="adm_lookup"),
-         InlineKeyboardButton("🪙 Give Tokens", callback_data="adm_tokens")],
-        [InlineKeyboardButton("🚫 Ban",         callback_data="adm_ban"),
-         InlineKeyboardButton("✅ Unban",        callback_data="adm_unban")],
-        [InlineKeyboardButton("🔙 হোম",          callback_data="home")]])
+        [InlineKeyboardButton("📊  Statistics",   callback_data="adm_stats"),
+         InlineKeyboardButton("📢  Broadcast",    callback_data="adm_broadcast")],
+        [InlineKeyboardButton("👤  User Lookup",  callback_data="adm_lookup"),
+         InlineKeyboardButton("🪙  Tokens দাও",  callback_data="adm_tokens")],
+        [InlineKeyboardButton("🚫  Ban",          callback_data="adm_ban"),
+         InlineKeyboardButton("✅  Unban",         callback_data="adm_unban")],
+        [InlineKeyboardButton("🔙  হোম",           callback_data="home")]])
 
 def kb_yt_choice(url: str):
     """YouTube link দিলে কী করবে জিজ্ঞেস করার keyboard"""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"▶️ Subtitle অনুবাদ ({COST['youtube']}🪙)", callback_data="yt_info")],
-        [InlineKeyboardButton("📥 Video ডাউনলোড 🆓",  callback_data="yt_download")],
-        [InlineKeyboardButton("🎵 MP3 ডাউনলোড 🆓",    callback_data="yt_dl_audio")]])
+        [InlineKeyboardButton("📥  Video ডাউনলোড  🆓",  callback_data="yt_download")],
+        [InlineKeyboardButton("🎵  MP3 Audio  🆓",       callback_data="yt_dl_audio")],
+        [InlineKeyboardButton("🔙  হোম",                callback_data="home")]])
 
 # ══════════════════════════════════════════════
 # /start
@@ -1013,8 +1084,45 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except: pass
         return
 
+    # ── noop (divider button) ──
+    if d == "noop":
+        await q.answer("", show_alert=False)
+        return
+
     await q.answer()
     user = get_user(uid)
+
+    # ── Refer ──
+    if d == "refer":
+        refs  = ref_count(uid)
+        bi    = await ctx.bot.get_me()
+        user2 = get_user(uid)
+        link  = f"https://t.me/{bi.username}?start={user2['referral_code']}"
+        msg_text = (
+            f"🤝 *Refer & Earn*\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"তোমার Referral Link:\n`{link}`\n\n"
+            f"📌 *কীভাবে কাজ করে:*\n"
+            f"বন্ধু link-এ click করে বট open করলে:\n"
+            f"• তুমি পাবে: *{REF_REFERRER} tokens* 🎁\n"
+            f"• বন্ধু পাবে: *{WELCOME_TOKENS+REF_REFEREE} tokens* 🎁\n\n"
+            f"📊 এখন পর্যন্ত: *{refs} জন* referred\n"
+            f"💰 মোট উপার্জন: *{refs*REF_REFERRER} tokens*"
+        )
+        await q.edit_message_text(
+            msg_text, parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔗  Link Copy করো", callback_data="refer_copy")],
+                [InlineKeyboardButton("🔙  হোম",            callback_data="home")]]))
+        return
+
+
+    if d == "refer_copy":
+        user3= get_user(uid)
+        bi2  = await ctx.bot.get_me()
+        link2= f"https://t.me/{bi2.username}?start={user3['referral_code']}"
+        await q.answer(f"Link: {link2}", show_alert=True)
+        return
 
     # ── SubDL ──
     if d.startswith("subdl_"):
@@ -1119,11 +1227,7 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল", callback_data="home")]])); return
 
-    # ── YouTube Subtitle ──
-    if d == "yt_info":
-        if not YT_AVAILABLE:
-            await q.edit_message_text("❌ yt-dlp install নেই।",
-                parse_mode='Markdown', reply_markup=kb_back()); return
+
         user_state[uid] = {'action':'yt_wait_url'}
         await q.edit_message_text(
             f"▶️ *YouTube Subtitle অনুবাদ*\n\n"
@@ -1139,69 +1243,88 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pending = ctx.user_data.get('yt_url_pending','')
         if pending:
             ctx.user_data.pop('yt_url_pending', None)
-            await q.edit_message_text("⏳ *Video download link তৈরি হচ্ছে...*\n\nএকটু অপেক্ষা করো...",
+            msg2 = await q.edit_message_text(
+                "⏳ *Video ডাউনলোড হচ্ছে...*\n\n"
+                "📥 720p পর্যন্ত ডাউনলোড হবে\n"
+                "⚠️ সর্বোচ্চ 50MB | একটু সময় লাগবে...",
                 parse_mode='Markdown')
-            loop    = asyncio.get_event_loop()
-            result  = await loop.run_in_executor(executor, cobalt_get_link, pending, "1080")
-            if not result or not result.get('url'):
-                result = await loop.run_in_executor(executor, cobalt_get_link, pending, "720")
-            if not result or not result.get('url'):
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(executor, yt_download_video, pending, "720")
+            if result.get('error'):
                 await q.edit_message_text(
-                    "❌ *Download link তৈরি হয়নি!*\n\nVideo টি private বা age-restricted হতে পারে।",
+                    f"❌ *ডাউনলোড হয়নি!*\n\n`{result['error']}`",
                     parse_mode='Markdown', reply_markup=kb_home()); return
-            dl_url = result.get('url',''); fname = result.get('filename','video.mp4')
+            size_mb = result['size'] / (1024*1024)
             await q.edit_message_text(
-                f"✅ *🎬 Download Link তৈরি হয়েছে!* 🆓\n\n"
-                f"📁 `{fname}`\n\n"
-                f"🔗 [👆 এখানে ক্লিক করো ডাউনলোড করতে]({dl_url})\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"⚠️ _Link ৬ ঘণ্টা valid থাকবে_",
-                parse_mode='Markdown', disable_web_page_preview=True,
+                f"✅ *ডাউনলোড সম্পন্ন!* পাঠাচ্ছি...\n\n"
+                f"📁 `{result['filename']}`\n"
+                f"📊 সাইজ: `{size_mb:.1f}MB`",
+                parse_mode='Markdown')
+            await q.message.reply_video(
+                video=io.BytesIO(result['data']),
+                filename=result['filename'],
+                caption=(f"🎬 *{result['title']}*\n\n"
+                         f"📥 yt-dlp দ্বারা ডাউনলোড | 🆓"),
+                parse_mode='Markdown',
+                supports_streaming=True,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬇️ ডাউনলোড করো", url=dl_url)],
                     [InlineKeyboardButton("📥 আরেকটি", callback_data="yt_download")],
-                    [InlineKeyboardButton("🔙 হোম", callback_data="home")]])); return
+                    [InlineKeyboardButton("🔙 হোম",     callback_data="home")]]))
+            return
 
         user_state[uid] = {'action':'yt_download_wait_url'}
         await q.edit_message_text(
-            "📥 *YouTube Video ডাউনলোড* 🆓\n\n"
+            "📥 *YouTube ডাউনলোড* 🆓\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
             "YouTube video-র link পাঠাও।\n"
-            "বট একটি *direct download link* তৈরি করবে।\n\n"
-            "📌 link-এ click করলেই download শুরু হবে! ⬇️\n\n"
-            "✅ *সম্পূর্ণ বিনামূল্যে — কোনো token লাগবে না!*\n"
-            "⚠️ Link ৬ ঘণ্টা valid থাকবে।",
+            "বট Telegram-এ সরাসরি পাঠাবে! ✅\n\n"
+            "📌 *সীমা:*\n"
+            "• Quality: 720p | Max: 50MB\n"
+            "• ছোট ভিডিও (৫-১৫ মিনিট) সেরা",
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎵 শুধু MP3 Audio", callback_data="yt_dl_audio")],
-                [InlineKeyboardButton("❌ বাতিল",          callback_data="home")]])); return
+                [InlineKeyboardButton("🎵  MP3 Audio",  callback_data="yt_dl_audio")],
+                [InlineKeyboardButton("🔙  হোম",        callback_data="home")]])); return
 
     # ── YouTube MP3 ──
     if d == "yt_dl_audio":
         pending = ctx.user_data.get('yt_url_pending','')
         if pending:
             ctx.user_data.pop('yt_url_pending', None)
-            await q.edit_message_text("⏳ *MP3 link তৈরি হচ্ছে...*", parse_mode='Markdown')
-            loop    = asyncio.get_event_loop()
-            result  = await loop.run_in_executor(executor, cobalt_get_audio, pending)
-            if not result or not result.get('url'):
-                await q.edit_message_text("❌ Audio link তৈরি হয়নি।", reply_markup=kb_home()); return
-            dl_url = result.get('url',''); fname = result.get('filename','audio.mp3')
             await q.edit_message_text(
-                f"✅ *🎵 MP3 Link তৈরি হয়েছে!* 🆓\n\n"
-                f"📁 `{fname}`\n\n"
-                f"🔗 [👆 এখানে ক্লিক করো ডাউনলোড করতে]({dl_url})\n\n"
-                f"⚠️ _Link ৬ ঘণ্টা valid_",
-                parse_mode='Markdown', disable_web_page_preview=True,
+                "⏳ *Audio ডাউনলোড হচ্ছে...*\n\n"
+                "🎵 MP3 format-এ ডাউনলোড হবে\n"
+                "একটু সময় লাগবে...",
+                parse_mode='Markdown')
+            loop   = asyncio.get_event_loop()
+            result = await loop.run_in_executor(executor, yt_download_audio, pending)
+            if result.get('error'):
+                await q.edit_message_text(
+                    f"❌ *ডাউনলোড হয়নি!*\n\n`{result['error']}`",
+                    parse_mode='Markdown', reply_markup=kb_home()); return
+            size_mb = result['size'] / (1024*1024)
+            await q.edit_message_text(
+                f"✅ *Audio ডাউনলোড সম্পন্ন!* পাঠাচ্ছি...\n\n"
+                f"📁 `{result['filename']}`\n📊 `{size_mb:.1f}MB`",
+                parse_mode='Markdown')
+            await q.message.reply_audio(
+                audio=io.BytesIO(result['data']),
+                filename=result['filename'],
+                title=result['title'],
+                caption=f"🎵 *{result['title']}*\n\n📥 yt-dlp | 🆓",
+                parse_mode='Markdown',
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬇️ ডাউনলোড করো", url=dl_url)],
-                    [InlineKeyboardButton("🔙 হোম", callback_data="home")]])); return
+                    [InlineKeyboardButton("🎵 আরেকটি", callback_data="yt_dl_audio")],
+                    [InlineKeyboardButton("🔙 হোম",     callback_data="home")]]))
+            return
 
         user_state[uid] = {'action':'yt_download_audio_url'}
         await q.edit_message_text(
-            "🎵 *MP3 Audio ডাউনলোড* 🆓\n\nYouTube link পাঠাও।",
+            "🎵 *MP3 Audio ডাউনলোড* 🆓\n\n"
+            "YouTube link পাঠাও।\n"
+            "বট MP3 হিসেবে Telegram-এ পাঠাবে! ✅",
             parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ বাতিল", callback_data="home")]])); return
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙  হোম", callback_data="home")]])); return
 
     # ── Search ──
     if d == "search":
@@ -1401,7 +1524,7 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                              f"━━━━━━━━━━━━━━━━━━━━━\n✅ {completed}/{total}"),
                     parse_mode='Markdown'), reply_markup=kb_cancel(u.id))
             except Exception as e: logger.warning(f"Edit ignored: {e}")
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.2)
 
         if ce.is_set() or active_tasks.get(u.id,False): add_tokens(u.id,cost); return
 
@@ -1565,50 +1688,67 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown', reply_markup=kb_home())
         log_history(u.id, oname, total, fl, tl, cost); return
 
-    # ── YouTube Video Download (Cobalt) ──
+    # ── YouTube Video/Audio Download (yt-dlp) ──
     if state.get('action') in ('yt_download_wait_url', 'yt_download_audio_url'):
         is_audio = (state.get('action') == 'yt_download_audio_url')
         if not ('youtube.com' in text or 'youtu.be' in text):
             await update.message.reply_text("❌ সঠিক YouTube link দাও!"); return
         user_state.pop(u.id, None)
         emoji    = "🎵" if is_audio else "🎬"
-        mode_txt = "MP3 Audio" if is_audio else "Video"
-        msg      = await update.message.reply_text(
-            f"⏳ *{emoji} {mode_txt} download link তৈরি হচ্ছে...*\n\nএকটু অপেক্ষা করো...",
+        mode_txt = "Audio (MP3)" if is_audio else "Video (720p)"
+        msg = await update.message.reply_text(
+            f"⏳ *{emoji} {mode_txt} ডাউনলোড হচ্ছে...*\n\n"
+            f"📥 সরাসরি ডাউনলোড চলছে\n"
+            f"⚠️ সর্বোচ্চ 50MB | একটু সময় লাগবে...",
             parse_mode='Markdown')
         loop = asyncio.get_event_loop()
         if is_audio:
-            result = await loop.run_in_executor(executor, cobalt_get_audio, text)
+            result = await loop.run_in_executor(executor, yt_download_audio, text)
         else:
-            result = await loop.run_in_executor(executor, cobalt_get_link, text, "1080")
-            if not result or not result.get('url'):
-                result = await loop.run_in_executor(executor, cobalt_get_link, text, "720")
-        if not result or not result.get('url'):
+            result = await loop.run_in_executor(executor, yt_download_video, text, "720")
+        if result.get('error'):
             await msg.edit_text(
-                "❌ *Download link তৈরি করা যায়নি!*\n\n"
-                "সম্ভাব্য কারণ:\n"
-                "• Video age-restricted বা private\n"
-                "• Cobalt server সাময়িকভাবে busy\n\n"
-                "_একটু পরে আবার চেষ্টা করো।_",
+                f"❌ *ডাউনলোড হয়নি!*\n\n`{result['error']}`\n\n"
+                f"💡 *সম্ভাব্য কারণ:*\n"
+                f"• ভিডিও 50MB-এর বেশি বড়\n"
+                f"• Private বা age-restricted\n"
+                f"• ছোট ভিডিও দিয়ে চেষ্টা করো",
                 parse_mode='Markdown', reply_markup=kb_home()); return
-        dl_url = result.get('url',''); fname = result.get('filename', f'video.{"mp3" if is_audio else "mp4"}')
+        size_mb = result['size'] / (1024*1024)
         await msg.edit_text(
-            f"✅ *{emoji} {mode_txt} Download Link তৈরি হয়েছে!* 🆓\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📁 ফাইল: `{fname}`\n\n"
-            f"🔗 *Download Link:*\n"
-            f"[👆 এখানে ক্লিক করো ডাউনলোড করতে]({dl_url})\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📌 *ব্যবহার:*\n"
-            f"• উপরের link-এ ক্লিক করো\n"
-            f"• Browser-এ download শুরু হবে ⬇️\n\n"
-            f"⚠️ _Link ৬ ঘণ্টা valid থাকবে_",
-            parse_mode='Markdown',
-            disable_web_page_preview=True,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"⬇️ {mode_txt} ডাউনলোড করো", url=dl_url)],
-                [InlineKeyboardButton("📥 আরেকটি ডাউনলোড", callback_data="yt_download")],
-                [InlineKeyboardButton("🔙 হোম", callback_data="home")]])); return
+            f"✅ *{emoji} ডাউনলোড সম্পন্ন!* Telegram-এ পাঠাচ্ছি...\n\n"
+            f"📁 `{result['filename']}`\n"
+            f"📊 সাইজ: `{size_mb:.1f}MB`",
+            parse_mode='Markdown')
+        try:
+            if is_audio:
+                await update.message.reply_audio(
+                    audio=io.BytesIO(result['data']),
+                    filename=result['filename'],
+                    title=result['title'],
+                    caption=f"🎵 *{result['title']}*\n\n📥 yt-dlp | 🆓",
+                    parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🎵 আরেকটি", callback_data="yt_dl_audio")],
+                        [InlineKeyboardButton("🔙 হোম",     callback_data="home")]]))
+            else:
+                await update.message.reply_video(
+                    video=io.BytesIO(result['data']),
+                    filename=result['filename'],
+                    caption=f"🎬 *{result['title']}*\n\n📥 yt-dlp | 🆓",
+                    parse_mode='Markdown',
+                    supports_streaming=True,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📥 আরেকটি", callback_data="yt_download")],
+                        [InlineKeyboardButton("🔙 হোম",     callback_data="home")]]))
+            await msg.delete()
+        except Exception as e:
+            await msg.edit_text(
+                f"❌ *Telegram-এ পাঠানো যায়নি!*\n\n"
+                f"সাইজ `{size_mb:.1f}MB` হয়তো বেশি বড়।\n"
+                f"ছোট ভিডিও দিয়ে চেষ্টা করো।",
+                parse_mode='Markdown', reply_markup=kb_home())
+        return
 
     # ── Search ──
     if ctx.user_data.get('awaiting_search'):
@@ -1672,7 +1812,9 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if 'youtube.com' in text or 'youtu.be' in text:
         ctx.user_data['yt_url_pending'] = text
         await update.message.reply_text(
-            "▶️ *YouTube Link পেয়েছি!*\n\nকী করতে চাও?",
+            "📥 *YouTube Link পেয়েছি!*\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "কী ডাউনলোড করতে চাও?",
             parse_mode='Markdown', reply_markup=kb_yt_choice(text)); return
 
     # ── AI Chat ──
@@ -1712,7 +1854,11 @@ def main():
     threading.Thread(target=self_ping, daemon=True).start()
     logger.info("✅ Flask + self-ping started")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (Application.builder()
+           .token(BOT_TOKEN)
+           .connection_pool_size(16)
+           .get_updates_connection_pool_size(8)
+           .build())
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("profile",  cmd_profile))
     app.add_handler(CommandHandler("referral", cmd_referral))
