@@ -29,6 +29,18 @@ try:
 except ImportError:
     YT_AVAILABLE = False
 
+try:
+    from duckduckgo_search import DDGS
+    DDG_AVAILABLE = True
+except ImportError:
+    DDG_AVAILABLE = False
+
+try:
+    from fpdf import FPDF
+    FPDF_AVAILABLE = True
+except ImportError:
+    FPDF_AVAILABLE = False
+
 # ══════════════════════════════════════════════
 # ⚙️  CONFIG
 # ══════════════════════════════════════════════
@@ -89,6 +101,7 @@ chat_mode     = {}
 chat_history  = {}
 pending_audio = {}
 user_state    = {}
+image_tasks   = {}   # {uid: cancel_flag}
 
 # ══════════════════════════════════════════════
 # 🗄️  DATABASE
@@ -671,6 +684,116 @@ def download_poster(url: str):
     except: pass
     return None
 
+
+# ══════════════════════════════════════════════
+# 🖼️  IMAGE SEARCH + PDF CREATOR
+# ══════════════════════════════════════════════
+def search_images(query: str, count: int) -> list:
+    """DuckDuckGo দিয়ে ছবির URL খোঁজো"""
+    if not DDG_AVAILABLE:
+        return []
+    urls = []
+    try:
+        with DDGS() as ddgs:
+            results = ddgs.images(
+                query,
+                max_results=min(count * 3, 60),   # extra নাও, কিছু fail হতে পারে
+                safesearch='moderate',
+            )
+            for r in results:
+                url = r.get('image','') or r.get('url','')
+                if url and url.startswith('http'):
+                    urls.append(url)
+                if len(urls) >= count * 2:
+                    break
+    except Exception as e:
+        logging.getLogger(__name__).error(f"DDG image search: {e}")
+    return urls
+
+
+def download_image(url: str, timeout: int = 10):
+    """একটি ছবি download করো, bytes ফেরত দাও"""
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get(url, timeout=timeout, headers=headers, stream=True)
+        if r.status_code == 200:
+            ct = r.headers.get('Content-Type','')
+            if 'image' in ct or ct == '':
+                data = r.content
+                if len(data) > 1000:   # tiny placeholder বাদ
+                    return data
+    except Exception:
+        pass
+    return None
+
+
+def create_pdf_from_images(
+    image_bytes_list: list,
+    topic: str,
+) -> bytes:
+    """
+    ছবির list থেকে PDF তৈরি করো।
+    প্রতিটি ছবি একটি page-এ।
+    """
+    from fpdf import FPDF
+    import struct, zlib
+
+    pdf = FPDF(orientation='P', unit='mm', format='A4')
+    pdf.set_auto_page_break(False)
+
+    A4_W, A4_H = 210, 297
+    MARGIN = 10
+
+    for img_bytes in image_bytes_list:
+        try:
+            # ছবি format detect করো
+            buf = io.BytesIO(img_bytes)
+            if img_bytes[:3] == b'\xff\xd8\xff':
+                ext = 'jpg'
+            elif img_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+                ext = 'png'
+            elif img_bytes[:6] in (b'GIF87a', b'GIF89a'):
+                ext = 'gif'
+            elif img_bytes[:4] == b'RIFF' and img_bytes[8:12] == b'WEBP':
+                ext = 'webp'
+            else:
+                ext = 'jpg'
+
+            # WEBP → JPEG convert (fpdf doesn't support webp)
+            if ext == 'webp':
+                try:
+                    from PIL import Image as PilImage
+                    pil_img = PilImage.open(io.BytesIO(img_bytes)).convert('RGB')
+                    new_buf = io.BytesIO()
+                    pil_img.save(new_buf, format='JPEG', quality=85)
+                    buf = new_buf; ext = 'jpg'
+                except Exception:
+                    continue
+
+            # Image dimensions
+            try:
+                from PIL import Image as PilImage
+                pil_img = PilImage.open(buf)
+                iw, ih = pil_img.size
+                buf.seek(0)
+            except Exception:
+                iw, ih = A4_W, A4_H
+
+            # Scale to fit A4
+            avail_w = A4_W - 2*MARGIN
+            avail_h = A4_H - 2*MARGIN
+            scale   = min(avail_w/iw, avail_h/ih)
+            fw, fh  = iw*scale, ih*scale
+            x = MARGIN + (avail_w - fw)/2
+            y = MARGIN + (avail_h - fh)/2
+
+            pdf.add_page()
+            pdf.image(buf, x=x, y=y, w=fw, h=fh)
+        except Exception:
+            continue
+
+    return pdf.output(dest='S').encode('latin-1')
+
 # ══════════════════════════════════════════════
 # 🔍  SUBDL
 # ══════════════════════════════════════════════
@@ -786,6 +909,7 @@ def kb_home():
         [InlineKeyboardButton("▬▬▬▬▬  Features  ▬▬▬▬▬", callback_data="noop")],
         [InlineKeyboardButton("🔍  Subtitle খোঁজো", callback_data="search")],
         [InlineKeyboardButton("📥  YouTube ডাউনলোড  🆓", callback_data="yt_download")],
+        [InlineKeyboardButton("🖼️  ছবি থেকে PDF বানাও", callback_data="img_pdf")],
         [InlineKeyboardButton("🛠  Subtitle Tools", callback_data="tools_menu"),
          InlineKeyboardButton("🎙  Audio → Text",   callback_data="audio_info")],
         [InlineKeyboardButton("💬  AI-এর সাথে কথা বলো  🤖", callback_data="chat_start")],
@@ -1393,6 +1517,64 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text(prompt,
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌", callback_data="home")]])); return
 
+    if d.startswith("img_count_"):
+        # format: img_count_N_topic
+        parts = d.split("_", 3)
+        # parts: ['img','count','N','topic']
+        try:
+            count = int(parts[2])
+            topic = parts[3] if len(parts) > 3 else "images"
+        except (ValueError, IndexError):
+            await q.answer("সমস্যা হয়েছে!", show_alert=True); return
+        user_state.pop(uid, None)
+        await q.answer()
+        try:
+            await q.edit_message_text(
+                f"🖼️ *`{topic}`* — {count}টি ছবি খোঁজা হচ্ছে...\n\n⏳ শুরু হচ্ছে...",
+                parse_mode='Markdown')
+        except Exception: pass
+        asyncio.create_task(
+            do_image_pdf(uid, topic, count, ctx.bot, q.message.chat_id))
+        return
+
+    # ── Image PDF ──
+    if d == "img_pdf":
+        if not DDG_AVAILABLE:
+            await q.edit_message_text(
+                "❌ *Image Search চালু নেই!*\n\n`duckduckgo-search` install নেই।",
+                parse_mode='Markdown', reply_markup=kb_back())
+            return
+        if not FPDF_AVAILABLE:
+            await q.edit_message_text(
+                "❌ *PDF তৈরি করা যাচ্ছে না!*\n\n`fpdf2` install নেই।",
+                parse_mode='Markdown', reply_markup=kb_back())
+            return
+        user_state[uid] = {'action': 'img_wait_topic'}
+        await q.edit_message_text(
+            "🖼️ *ছবি থেকে PDF বানাও*\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "📌 *কোন বিষয়ের ছবি চাও?*\n\n"
+            "উদাহরণ:\n"
+            "`Bangladesh nature`\n"
+            "`Space galaxy nebula`\n"
+            "`Tiger in jungle`\n"
+            "`Eiffel Tower Paris`\n\n"
+            "_English-এ লিখলে সেরা ফলাফল পাবে_",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌  বাতিল", callback_data="home")]]))
+        return
+
+    if d == "img_cancel":
+        image_tasks[uid] = True
+        await q.answer("❌ বাতিল করা হচ্ছে...", show_alert=False)
+        try:
+            await q.edit_message_text(
+                "❌ *PDF তৈরি বাতিল করা হয়েছে।*",
+                parse_mode='Markdown', reply_markup=kb_home())
+        except Exception: pass
+        return
+
     # ── Home ──
     if d == "home":
         chat_mode[uid] = False
@@ -1402,6 +1584,148 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             "🎬 *Subtitle BD Bot*\n\nফাইল বা YouTube link পাঠাও! 🚀",
             parse_mode='Markdown', reply_markup=kb_home())
+
+
+# ══════════════════════════════════════════════
+# 🖼️  IMAGE PDF TASK
+# ══════════════════════════════════════════════
+async def do_image_pdf(uid: int, topic: str, count: int,
+                       bot, chat_id: int):
+    """ছবি খুঁজে PDF তৈরি করে পাঠাও"""
+    image_tasks[uid] = False   # running
+
+    # ── Status message ──
+    status = await bot.send_message(
+        chat_id,
+        f"🔍 *`{topic}`* বিষয়ে ছবি খোঁজা হচ্ছে...\n\n⏳ একটু অপেক্ষা করো...",
+        parse_mode='Markdown')
+
+    try:
+        loop = asyncio.get_event_loop()
+
+        # ── Step 1: Search URLs ──
+        urls = await loop.run_in_executor(
+            executor, search_images, topic, count)
+
+        if not urls:
+            await bot.edit_message_text(
+                "❌ *কোনো ছবি পাওয়া যায়নি!*\n\n"
+                "অন্য keyword দিয়ে আবার চেষ্টা করো।",
+                chat_id=chat_id, message_id=status.message_id,
+                parse_mode='Markdown', reply_markup=kb_home())
+            return
+
+        total_urls  = len(urls)
+        downloaded  = []
+        failed      = 0
+
+        # ── Step 2: Download images with progress ──
+        for i, url in enumerate(urls):
+            if image_tasks.get(uid, False):   # cancel check
+                await bot.edit_message_text(
+                    "❌ *বাতিল করা হয়েছে।*",
+                    chat_id=chat_id, message_id=status.message_id,
+                    reply_markup=kb_home())
+                return
+
+            if len(downloaded) >= count:
+                break
+
+            img_data = await loop.run_in_executor(executor, download_image, url)
+            if img_data:
+                downloaded.append(img_data)
+            else:
+                failed += 1
+
+            # Progress update every 3 downloads
+            done    = len(downloaded)
+            pct     = int(done / count * 100)
+            bar     = '█' * (pct // 5) + '░' * (20 - pct // 5)
+
+            if i % 3 == 0 or done >= count:
+                try:
+                    await bot.edit_message_text(
+                        f"📥 *ছবি ডাউনলোড হচ্ছে...*\n\n"
+                        f"🔍 বিষয়: `{topic}`\n"
+                        f"`[{bar}]` *{pct}%*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"✅ পাওয়া গেছে: *{done}/{count}*\n"
+                        f"❌ পাওয়া যায়নি: *{failed}*",
+                        chat_id=chat_id, message_id=status.message_id,
+                        parse_mode='Markdown',
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("❌  বাতিল", callback_data="img_cancel")]]))
+                except Exception:
+                    pass
+
+            await asyncio.sleep(0.1)
+
+        if not downloaded:
+            await bot.edit_message_text(
+                "❌ *কোনো ছবি ডাউনলোড হয়নি!*\n\n"
+                "Internet সমস্যা বা ছবিগুলো protected।\nআবার চেষ্টা করো।",
+                chat_id=chat_id, message_id=status.message_id,
+                parse_mode='Markdown', reply_markup=kb_home())
+            return
+
+        # ── Step 3: Create PDF ──
+        if image_tasks.get(uid, False): return
+
+        await bot.edit_message_text(
+            f"📄 *PDF তৈরি হচ্ছে...*\n\n"
+            f"🖼️ {len(downloaded)}টি ছবি দিয়ে PDF বানানো হচ্ছে...\n"
+            f"⏳ একটু অপেক্ষা করো...",
+            chat_id=chat_id, message_id=status.message_id,
+            parse_mode='Markdown')
+
+        pdf_bytes = await loop.run_in_executor(
+            executor, create_pdf_from_images, downloaded, topic)
+
+        if not pdf_bytes:
+            await bot.edit_message_text(
+                "❌ *PDF তৈরি হয়নি!*\n\nআবার চেষ্টা করো।",
+                chat_id=chat_id, message_id=status.message_id,
+                reply_markup=kb_home())
+            return
+
+        size_kb = len(pdf_bytes) / 1024
+        fname   = re.sub(r'[^\w\s-]', '', topic)[:30].strip() + '_images.pdf'
+
+        # ── Step 4: Send PDF ──
+        await bot.edit_message_text(
+            f"✅ *PDF তৈরি সম্পন্ন!*\n\n"
+            f"🖼️ {len(downloaded)}টি ছবি | 📄 {size_kb:.0f}KB\n"
+            f"পাঠাচ্ছি...",
+            chat_id=chat_id, message_id=status.message_id,
+            parse_mode='Markdown')
+
+        await bot.send_document(
+            chat_id=chat_id,
+            document=io.BytesIO(pdf_bytes),
+            filename=fname,
+            caption=(
+                f"📄 *{topic}* — ছবির PDF\n\n"
+                f"🖼️ {len(downloaded)}টি ছবি | 📊 {size_kb:.0f}KB\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"_🖼️ ছবি → PDF বট দ্বারা তৈরি_"
+            ),
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🖼️  আরেকটি PDF", callback_data="img_pdf")],
+                [InlineKeyboardButton("🔙  হোম",         callback_data="home")]]))  
+
+        await bot.delete_message(chat_id=chat_id, message_id=status.message_id)
+
+    except Exception as e:
+        logger.error(f"Image PDF error for {uid}: {e}")
+        try:
+            await bot.edit_message_text(
+                f"❌ *সমস্যা হয়েছে!*\n\n`{str(e)[:150]}`",
+                chat_id=chat_id, message_id=status.message_id,
+                parse_mode='Markdown', reply_markup=kb_home())
+        except Exception: pass
+    finally:
+        image_tasks.pop(uid, None)
 
 # ══════════════════════════════════════════════
 # 📁  FILE HANDLER
@@ -1581,6 +1905,40 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await check_access(u.id, ctx.bot, update.message.reply_text): return
     user  = get_user(u.id, u.username, u.first_name)
     state = user_state.get(u.id, {})
+
+    # ── Image PDF: topic wait ──
+    if state.get('action') == 'img_wait_topic':
+        topic = text.strip()
+        if not topic:
+            await update.message.reply_text("❌ বিষয়টা লেখো!"); return
+        user_state[u.id] = {'action': 'img_wait_count', 'topic': topic}
+        await update.message.reply_text(
+            f"✅ বিষয়: *`{topic}`*\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 কতটি ছবি চাও?\n\n"
+            f"সংখ্যা লেখো (সর্বোচ্চ ২০):\n"
+            f"_বেশি ছবি = বেশি সময়_",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("5️⃣  ৫টি",   callback_data=f"img_count_5_{topic[:30]}"),
+                 InlineKeyboardButton("1️⃣0️⃣  ১০টি", callback_data=f"img_count_10_{topic[:30]}")],
+                [InlineKeyboardButton("1️⃣5️⃣  ১৫টি", callback_data=f"img_count_15_{topic[:30]}"),
+                 InlineKeyboardButton("2️⃣0️⃣  ২০টি", callback_data=f"img_count_20_{topic[:30]}")],
+                [InlineKeyboardButton("❌  বাতিল",   callback_data="home")]]))
+        return
+
+    # ── Image PDF: count wait (manual input) ──
+    if state.get('action') == 'img_wait_count':
+        try:
+            count = int(text.strip())
+            if count < 1:   count = 1
+            if count > 20:  count = 20
+        except ValueError:
+            await update.message.reply_text("❌ শুধু সংখ্যা লেখো! (যেমন: 10)"); return
+        topic = state.get('topic','images')
+        user_state.pop(u.id, None)
+        asyncio.create_task(do_image_pdf(u.id, topic, count, ctx.bot, update.effective_chat.id))
+        return
 
     # ── Timing offset ──
     if state.get('action') == 'timing_wait_offset':
