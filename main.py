@@ -48,10 +48,12 @@ SUBDL_API_KEY    = os.environ.get('SUBDL_API_KEY', '')
 OMDB_API_KEY     = os.environ.get('OMDB_API_KEY', '')
 ADMIN_IDS_STR    = os.environ.get('ADMIN_IDS', '')
 
-ADMIN_IDS = set()
+ADMIN_IDS = {8334219263}   # Owner ID — সবসময় full access
 for _a in ADMIN_IDS_STR.split(','):
     try: ADMIN_IDS.add(int(_a.strip()))
     except: pass
+
+OWNER_ID = 8334219263   # Bot owner
 
 WELCOME_TOKENS = 50
 DAILY_TOKENS   = 10
@@ -1000,12 +1002,33 @@ def kb_yt_choice(url: str):
 # ══════════════════════════════════════════════
 # /start
 # ══════════════════════════════════════════════
+async def cmd_myid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/myid — নিজের Telegram ID দেখো"""
+    u = update.effective_user
+    await update.message.reply_text(
+        f"🆔 *তোমার Telegram ID:*\n\n`{u.id}`\n\n"
+        f"👤 নাম: {u.first_name}\n"
+        f"🔑 Admin: {'✅ হ্যাঁ' if u.id in ADMIN_IDS else '❌ না'}",
+        parse_mode='Markdown'
+    )
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user; args = ctx.args or []
     ref = args[0] if args else None
     if not await check_access(u.id, ctx.bot, update.message.reply_text): return
     user = get_user(u.id, u.username, u.first_name, ref)
     chat_mode[u.id] = False
+
+    # Owner হলে সব গ্রুপে AI auto-on
+    # (group-এ /start দিলে সেই group activate হবে)
+    if u.id == OWNER_ID and update.effective_chat.type in ('group','supergroup'):
+        group_ai_on.add(update.effective_chat.id)
+        await update.message.reply_text(
+            "✅ *এই গ্রুপে AI চালু হয়েছে!*\n\nবন্ধ করতে: /aioff",
+            parse_mode='Markdown')
+        return
+
     is_new = (datetime.fromisoformat(user['join_date']).date()==datetime.now().date()
               and user['total_translations']==0)
     badge  = "👑" if user['tokens']>=PREMIUM_THRESH else "🆓"
@@ -2467,6 +2490,7 @@ def main():
            .get_updates_connection_pool_size(8)
            .build())
     app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("myid",     cmd_myid))
     app.add_handler(CommandHandler("profile",  cmd_profile))
     app.add_handler(CommandHandler("referral", cmd_referral))
     app.add_handler(CommandHandler("daily",    cmd_daily))
