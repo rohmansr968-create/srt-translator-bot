@@ -1948,9 +1948,14 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.text: return
     text = msg.text.strip()
 
-    # Group/Supergroup হলে group handler-এ পাঠাও, এখানে কিছু করো না
+    # Group/Supergroup হলে group handler-এ পাঠাও
     if msg.chat.type in ('group', 'supergroup'):
         await handle_group_message(update, ctx)
+        return
+
+    # Kicked user private DM check
+    if u.id in kicked_users:
+        await handle_kicked_user_dm(update, ctx)
         return
 
     if not await check_access(u.id, ctx.bot, update.message.reply_text): return
@@ -2253,13 +2258,28 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════
-# 🤖  GROUP AI FUNCTIONS
+# 🤖  GROUP AI — সব ফিচার
 # ══════════════════════════════════════════════
+
+# গ্রুপের প্রতিটি ইউজারের conversation history
+# { (chat_id, user_id): [ {role, content}, ... ] }
+group_history  = {}
+# কাকে warn দিয়েছি এবং কেন
+# { (chat_id, user_id): [ "reason1", ... ] }
+warn_reasons   = {}
+# kick হওয়া ইউজার — ক্ষমার সুযোগ একবার
+# { user_id: {'chat_id': ..., 'name': ..., 'forgiven': False} }
+kicked_users   = {}
+
+MAX_GROUP_HIST = 20   # প্রতি ইউজারের সর্বোচ্চ history
+WORDS_PER_MIN  = 200  # পড়ার গড় speed (words/min)
+
 GROUP_AI_SYSTEM = (
     "তুমি একটি গ্রুপ চ্যাটের AI সহকারী। "
     "বাংলায় সহজ ও বন্ধুত্বপূর্ণভাবে উত্তর দাও। "
     "সংক্ষিপ্ত কিন্তু সহায়ক উত্তর দাও। "
-    "প্রয়োজনে English ব্যবহার করতে পারো।"
+    "প্রয়োজনে English ব্যবহার করতে পারো। "
+    "আগের কথোপকথন মনে রেখে consistent উত্তর দাও।"
 )
 
 OBSCENE_SYSTEM = (
@@ -2270,8 +2290,25 @@ OBSCENE_SYSTEM = (
     "Nothing else."
 )
 
+FORGIVE_SYSTEM = (
+    "তুমি একটি গ্রুপের AI moderator। "
+    "একজন ব্যবহারকারী ক্ষমা চাইছে কারণ সে গ্রুপ থেকে বের করা হয়েছে। "
+    "তার ক্ষমার আবেদন পড়ে সিদ্ধান্ত নাও — সত্যিকারের অনুতাপ আছে কিনা। "
+    "যদি সত্যিই অনুতাপী মনে হয় তাহলে reply শুরু করো FORGIVEN দিয়ে। "
+    "নইলে reply শুরু করো DENIED দিয়ে। "
+    "তারপর বাংলায় সংক্ষিপ্ত বার্তা দাও।"
+)
+
+
+def calc_read_time(text: str) -> float:
+    """মেসেজ পড়তে কত সেকেন্ড লাগবে হিসাব করো"""
+    word_count = len(text.split())
+    seconds    = (word_count / WORDS_PER_MIN) * 60
+    # Minimum ১৫s, maximum ১২০s
+    return max(15.0, min(seconds, 120.0))
+
+
 def is_obscene_sync(text: str) -> bool:
-    """Groq AI দিয়ে অশ্লীল মেসেজ detect করো"""
     try:
         resp = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -2279,46 +2316,101 @@ def is_obscene_sync(text: str) -> bool:
                 {"role": "system", "content": OBSCENE_SYSTEM},
                 {"role": "user",   "content": f"Message: {text[:500]}"}
             ],
-            temperature=0.0,
-            max_tokens=10
-        )
-        result = resp.choices[0].message.content.strip().upper()
-        return "OBSCENE" in result
+            temperature=0.0, max_tokens=10)
+        return "OBSCENE" in resp.choices[0].message.content.strip().upper()
     except Exception as e:
         logger.error(f"Obscene check error: {e}")
         return False
 
 
-def group_ai_reply_sync(user_name: str, text: str) -> str:
-    """গ্রুপ মেসেজের AI reply তৈরি করো"""
+def group_ai_reply_sync(chat_id: int, user_id: int,
+                         user_name: str, text: str) -> str:
+    """
+    প্রতিটি ইউজারের আলাদা history রেখে AI reply দাও।
+    """
+    key = (chat_id, user_id)
+    if key not in group_history:
+        group_history[key] = []
+
+    group_history[key].append({"role": "user", "content": f"{user_name}: {text}"})
+    # Max history বজায় রাখো
+    if len(group_history[key]) > MAX_GROUP_HIST:
+        group_history[key] = group_history[key][-MAX_GROUP_HIST:]
+
+    # Warn context যোগ করো system prompt-এ
+    warns = warn_reasons.get(key, [])
+    sys_prompt = GROUP_AI_SYSTEM
+    if warns:
+        sys_prompt += (
+            f" এই ইউজারকে আগে সতর্ক করা হয়েছিল কারণ: {', '.join(warns[-3:])}।"
+            f" যদি সে জানতে চায় কেন warning দিয়েছিলে, বলো।"
+        )
+
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "system", "content": sys_prompt}]
+                     + group_history[key],
+            temperature=0.7, max_tokens=512)
+        reply = resp.choices[0].message.content.strip()
+        # AI reply-ও history-তে রাখো
+        group_history[key].append({"role": "assistant", "content": reply})
+        return reply
+    except Exception as e:
+        if _iq(e): return "⚠️ API limit শেষ।"
+        return ""
+
+
+def check_forgiveness_sync(user_name: str, apology_text: str,
+                             kick_reasons: list) -> tuple:
+    """
+    ক্ষমার আবেদন যাচাই করো।
+    Returns: (forgiven: bool, reply_text: str)
+    """
+    reasons_str = ", ".join(kick_reasons) if kick_reasons else "গ্রুপের নিয়ম লঙ্ঘন"
+    prompt = (
+        f"{user_name} was kicked for: {reasons_str}.\n"
+        f"Now they say: {apology_text}"
+    )
     try:
         resp = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": GROUP_AI_SYSTEM},
-                {"role": "user",   "content": f"{user_name} বলেছে: {text}"}
+                {"role": "system", "content": FORGIVE_SYSTEM},
+                {"role": "user",   "content": prompt}
             ],
-            temperature=0.7,
-            max_tokens=512
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        if _iq(e):
-            return "⚠️ API limit শেষ।"
-        return ""
+            temperature=0.4, max_tokens=256)
+        reply = resp.choices[0].message.content.strip()
+        forgiven = reply.upper().startswith("FORGIVEN")
+        # FORGIVEN/DENIED prefix বাদ দিয়ে বার্তা নাও
+        clean_reply = reply.replace("FORGIVEN", "").replace("DENIED", "").strip()
+        if not clean_reply:
+            clean_reply = "আবেদন পর্যালোচনা করা হয়েছে।"
+        return forgiven, clean_reply
+    except Exception:
+        return False, "এই মুহূর্তে যাচাই করা সম্ভব হয়নি।"
 
 
 # ══════════════════════════════════════════════
 # 🤖  GROUP MESSAGE HANDLER
 # ══════════════════════════════════════════════
+async def auto_delete_after(bot, chat_id: int, msg_id: int, delay: float):
+    """নির্দিষ্ট সময় পরে bot-এর message মুছো"""
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+    except Exception:
+        pass
+
+
 async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """গ্রুপের সব মেসেজ handle করো — NO channel check, NO private bot buttons"""
-    msg  = update.message
+    """গ্রুপের সব মেসেজ handle করো"""
+    msg = update.message
     if not msg or not msg.text:
         return
 
-    chat_id = msg.chat_id
-    user    = msg.from_user
+    chat_id  = msg.chat_id
+    user     = msg.from_user
     if not user or user.is_bot:
         return
 
@@ -2330,61 +2422,184 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── Step 1: Obscene check ──
     is_bad = await loop.run_in_executor(executor, is_obscene_sync, text)
+
     if is_bad:
+        # মেসেজ মুছো
         try:
             await msg.delete()
         except Exception:
             pass
-        # Warn the user
-        key = (chat_id, user.id)
+
+        key        = (chat_id, user.id)
         group_warns[key] = group_warns.get(key, 0) + 1
         warn_count = group_warns[key]
 
-        warn_msg = await ctx.bot.send_message(
-            chat_id,
-            f"⚠️ {user.first_name} তোমার মেসেজটি অনুপযুক্ত — মুছে দেওয়া হয়েছে।"
-            f" সতর্কতা: {warn_count}/3",
-        )
+        # Warn reason সেভ করো
+        if key not in warn_reasons:
+            warn_reasons[key] = []
+        warn_reasons[key].append(f"অনুপযুক্ত মেসেজ (#{warn_count})")
 
-        # 3 বার warn হলে kick করো
         if warn_count >= 3:
+            # Kick করো
             try:
                 await ctx.bot.ban_chat_member(chat_id, user.id)
-                await ctx.bot.send_message(
-                    chat_id,
-                    f"🚫 {user.first_name} (ID:{user.id}) — ৩ বার সতর্কতার পরে গ্রুপ থেকে বের করা হয়েছে."
-                )
                 group_warns.pop(key, None)
+
+                # Kick কারণ সেভ করো
+                reasons = warn_reasons.get(key, ["গ্রুপের নিয়ম লঙ্ঘন"])
+                kicked_users[user.id] = {
+                    'chat_id':  chat_id,
+                    'name':     user.first_name,
+                    'reasons':  reasons,
+                    'forgiven': False,
+                }
+                warn_reasons.pop(key, None)
+
+                # Group-এ kick notification
+                kick_notif = await ctx.bot.send_message(
+                    chat_id,
+                    f"🚫 {user.first_name} কে ৩টি সতর্কতার পরে গ্রুপ থেকে বের করা হয়েছে।"
+                )
+                asyncio.create_task(
+                    auto_delete_after(ctx.bot, chat_id, kick_notif.message_id, 30))
+
+                # ব্যক্তিগতভাবে DM করো — কেন kick হলো বিস্তারিত
+                reasons_text = "\n".join(f"\u2022 {r}" for r in reasons)
+                dm_text = (
+                    f"\U0001f6ab *\u062a\u09cb\u09ae\u09be\u0995\u09c7 \u0997\u09cd\u09b0\u09c1\u09aa \u09a5\u09c7\u0995\u09c7 \u09ac\u09c7\u09b0 \u0995\u09b0\u09be \u09b9\u09df\u09c7\u099b\u09c7\u0964*\n\n"
+                    f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                    f"\U0001f4cb *\u0995\u09be\u09b0\u09a3:*\n{reasons_text}\n\n"
+                    f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                    f"\U0001f4ac \u09af\u09a6\u09bf \u09ae\u09a8\u09c7 \u0995\u09b0\u09cb \u098f\u099f\u09be \u09ad\u09c1\u09b2 \u09b9\u09df\u09c7\u099b\u09c7 \u09ac\u09be \u0995\u09cd\u09b7\u09ae\u09be \u099a\u09be\u0987\u09a4\u09c7 \u099a\u09be\u0993,\n"
+                    "\u098f\u0996\u09be\u09a8\u09c7 \u09b2\u09c7\u0996\u09cb \u2014 AI \u09ac\u09bf\u09ac\u09c7\u099a\u09a8\u09be \u0995\u09b0\u09ac\u09c7\u0964\n\n"
+                    "_\u09b8\u09a4\u09cd\u09af\u09bf\u0995\u09be\u09b0\u09c7\u09b0 \u0985\u09a8\u09c1\u09a4\u09be\u09aa \u09a6\u09c7\u0996\u09be\u09b2\u09c7 \u098f\u0995\u09ac\u09be\u09b0 \u09b8\u09c1\u09af\u09cb\u0997 \u09a6\u09c7\u0993\u09af\u09bc\u09be \u09b9\u09a4\u09c7 \u09aa\u09be\u09b0\u09c7\u0964_"
+                )
+                try:
+                    await ctx.bot.send_message(
+                        user.id, dm_text, parse_mode='Markdown')
+                except Exception:
+                    pass   # ইউজার DM বন্ধ করে রাখলে skip
+
             except Exception as e:
                 logger.warning(f"Kick failed: {e}")
 
-        # Warning message ৩০ সেকেন্ড পর মুছে দাও
-        await asyncio.sleep(30)
-        try:
-            await warn_msg.delete()
-        except Exception:
-            pass
+        else:
+            # Warn notification
+            warn_notif = await ctx.bot.send_message(
+                chat_id,
+                f"Warning {warn_count}/3: {user.first_name} - message removed for rule violation."
+            )
+            asyncio.create_task(
+                auto_delete_after(ctx.bot, chat_id, warn_notif.message_id, 30))
         return
 
-    # ── Step 2: AI reply (if group AI is enabled) ──
-    if chat_id not in group_ai_on:
-        return
-
-    # Typing indicator
+    # ── Step 2: AI reply — history সহ ──
+    group_ai_on.add(chat_id)
     await ctx.bot.send_chat_action(chat_id, "typing")
 
-    user_name = user.first_name or user.username or "কেউ"
+    user_name  = user.first_name or user.username or "Someone"
     reply_text = await loop.run_in_executor(
         executor,
-        functools.partial(group_ai_reply_sync, user_name, text)
+        functools.partial(group_ai_reply_sync, chat_id, user.id, user_name, text)
     )
 
     if reply_text:
         try:
-            await msg.reply_text(reply_text)
+            sent = await msg.reply_text(reply_text)
+            # পড়ার সময় হিসাব করে auto-delete
+            read_time = calc_read_time(reply_text)
+            asyncio.create_task(
+                auto_delete_after(ctx.bot, chat_id, sent.message_id, read_time))
         except Exception as e:
             logger.warning(f"Group reply failed: {e}")
 
+
+# ══════════════════════════════════════════════
+# 💌  PRIVATE DM — Forgiveness Handler
+# ══════════════════════════════════════════════
+async def handle_kicked_user_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Kick হওয়া ইউজার private-এ বটকে message করলে
+    ক্ষমার আবেদন process করো।
+    """
+    msg  = update.message
+    if not msg or not msg.text: return
+    u    = msg.from_user
+    text = msg.text.strip()
+
+    if u.id not in kicked_users:
+        return   # Kick হয়নি — normal handle_text চলবে
+
+    info = kicked_users[u.id]
+
+    if info.get('forgiven'):
+        await msg.reply_text(
+            "Already forgiven once. No more chances."
+        )
+        return
+
+    # ক্ষমার আবেদন যাচাই করো
+    await ctx.bot.send_chat_action(msg.chat_id, "typing")
+    loop = asyncio.get_event_loop()
+    forgiven, reply = await loop.run_in_executor(
+        executor,
+        functools.partial(
+            check_forgiveness_sync,
+            u.first_name,
+            text,
+            info.get('reasons', [])
+        )
+    )
+
+    if forgiven:
+        info['forgiven'] = True
+        try:
+            # Ban তুলে নাও
+            await ctx.bot.unban_chat_member(
+                info['chat_id'], u.id,
+                only_if_banned=True)
+
+            # Group-এ ফিরে আসার invitation
+            try:
+                invite = await ctx.bot.create_chat_invite_link(
+                    info['chat_id'],
+                    member_limit=1,
+                    expire_date=int(time.time()) + 3600  # ১ ঘণ্টা valid
+                )
+                invite_link = invite.invite_link
+            except Exception:
+                invite_link = None
+
+            dm_reply = (
+                "\u2705 *Your forgiveness request has been accepted.*\n\n"
+                f"_{reply}_\n\n"
+                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            )
+            if invite_link:
+                dm_reply += (
+                    f"\U0001f517 To rejoin the group, use this link: {invite_link}\n"
+                    f"_(valid for 1 hour)_"
+                )
+
+            await msg.reply_text(dm_reply, parse_mode='Markdown')
+
+            # Group-এ notification
+            try:
+                await ctx.bot.send_message(
+                    info['chat_id'],
+                    f"✅ {u.first_name} ক্ষমা চেয়েছে এবং আবার group-এ যোগ দেওয়ার সুযোগ পেয়েছে।"
+                )
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.error(f"Unban failed: {e}")
+            await msg.reply_text("❌ Ban তুলতে সমস্যা হয়েছে। Admin-কে জানাও।")
+    else:
+        await msg.reply_text(
+            f"\u274c Forgiveness denied. {reply}",
+            parse_mode='Markdown'
+        )
 
 # ── Group Commands ──
 async def is_group_admin(chat_id: int, user_id: int, bot) -> bool:
@@ -2408,10 +2623,6 @@ async def cmd_groupai_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not msg: return
     chat_id = msg.chat_id
 
-    if not await is_group_admin(chat_id, msg.from_user.id, ctx.bot):
-        await msg.reply_text("❌ শুধু Admin এই command দিতে পারবে!")
-        return
-
     group_ai_on.add(chat_id)
     await msg.reply_text(
         "✅ *গ্রুপ AI চালু হয়েছে!*\n\n"
@@ -2426,10 +2637,6 @@ async def cmd_groupai_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg: return
     chat_id = msg.chat_id
-
-    if not await is_group_admin(chat_id, msg.from_user.id, ctx.bot):
-        await msg.reply_text("❌ শুধু Admin এই command দিতে পারবে!")
-        return
 
     group_ai_on.discard(chat_id)
     await msg.reply_text(
@@ -2463,8 +2670,7 @@ async def cmd_clearwarns(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not msg: return
     chat_id = msg.chat_id
 
-    if not await is_group_admin(chat_id, msg.from_user.id, ctx.bot):
-        await msg.reply_text("❌ শুধু Admin পারবে!"); return
+
 
     keys = [k for k in group_warns if k[0] == chat_id]
     for k in keys:
