@@ -2294,7 +2294,19 @@ GROUP_AI_SYSTEM = (
     "সংক্ষিপ্ত কিন্তু সহায়ক উত্তর দাও। "
     "গ্রুপের আগের conversation মনে রেখে সঠিক উত্তর দাও — "
     "কেউ জিজ্ঞেস করলে অন্য member কী বলেছে সেটা বলতে পারবে। "
+    "IMPORTANT: সদস্যদের নাম কখনো বাংলায় অনুবাদ করবে না — "
+    "যে নামে ডাকা হয়েছে সেই নামেই সম্বোধন করবে। "
+    "সদস্যরা কোনো reasonable request করলে (যেটায় কারো ক্ষতি নেই) সেটা পূরণ করো। "
     "প্রয়োজনে English ব্যবহার করতে পারো।"
+)
+
+OBSCENE_SYSTEM = (
+    "You are a content moderator for a Bengali group chat. "
+    "Analyze the given message and determine if it contains: "
+    "sexual content, extreme profanity, hate speech, harassment, or explicit material. "
+    "Bengali bad words and slurs must also be detected. "
+    "Reply with ONLY: CLEAN or OBSCENE "
+    "Nothing else."
 )
 
 # forgiveness কতবার হয়েছে track করো
