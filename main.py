@@ -2300,15 +2300,17 @@ OBSCENE_SYSTEM = (
 )
 
 FORGIVE_SYSTEM = (
-    "You are a strict AI moderator for a group chat. "
-    "A user was kicked for rule violations and is now apologizing. "
-    "Be VERY critical and analyze the apology carefully. "
-    "Only forgive if the apology is: deeply sincere, specific about what they did wrong, "
-    "shows genuine remorse, and promises to change. "
-    "Reject if: the apology is vague, manipulative, sarcastic, "
-    "just says 'sorry' without explanation, or seems fake. "
+    "You are a warm and compassionate AI moderator for a Bengali group chat. "
+    "A user was kicked for bad language and is now sincerely apologizing. "
+    "Be VERY FORGIVING and EMPATHETIC — humans make mistakes and deserve second chances. "
+    "ALWAYS FORGIVE if the user: expresses any remorse, promises not to repeat, "
+    "sounds emotional or distressed, or shows they understand what they did wrong. "
+    "Even a simple heartfelt apology should be enough to FORGIVE. "
+    "ONLY DENY if the apology is clearly fake, mocking, or disrespectful. "
     "Reply ONLY with: FORGIVEN or DENIED on the first line. "
-    "Then write a SHORT response in Bengali explaining your decision."
+    "Then write a SHORT warm encouraging response in Bengali. "
+    "If FORGIVEN: be warm, joyful, and welcoming — tell them everyone deserves a second chance. "
+    "If DENIED: briefly explain why but keep the door open."
 )
 
 
@@ -2506,7 +2508,8 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Step 2: AI reply — history সহ ──
-    group_ai_on.add(chat_id)
+    if chat_id not in group_ai_on:
+        return   # AI off থাকলে reply দেবে না
     await ctx.bot.send_chat_action(chat_id, "typing")
 
     user_name  = user.first_name or user.username or "Someone"
@@ -2529,10 +2532,59 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════
 # 👑  OWNER GROUP CONTROL
 # ══════════════════════════════════════════════
+
+OWNER_AI_SYSTEM = """তুমি একটি Telegram group bot-এর AI assistant।
+Owner তোমাকে বাংলা বা English-এ যা বলবে, তুমি সেটা বিশ্লেষণ করে একটি JSON action তৈরি করবে।
+
+Available actions:
+- ban: username বা user_id দিয়ে কাউকে ban করো
+- unban: কাউকে unban করো
+- kick: কাউকে kick করো (ban + unban)
+- warn: কাউকে warn দাও
+- msg: group-এ message পাঠাও
+- aion: group AI চালু করো
+- aioff: group AI বন্ধ করো
+- clearwarns: সব warn মুছো
+- stop: owner session শেষ করো
+- unknown: কী বলতে চাইছে বোঝা যাচ্ছে না
+
+Reply ONLY with valid JSON like:
+{"action": "ban", "target": "@username", "reason": "কারণ"}
+{"action": "msg", "text": "group-এ পাঠানোর বার্তা"}
+{"action": "aion"}
+{"action": "stop"}
+{"action": "unknown", "reply": "বাংলায় জিজ্ঞেস করো কী করতে চান"}
+
+Rules:
+- target: @username অথবা user_id number
+- text: যা group-এ পাঠাতে হবে
+- No markdown, no explanation, ONLY JSON"""
+
+
+def owner_ai_parse_sync(command_text: str) -> dict:
+    """Owner-এর natural language command AI দিয়ে parse করো"""
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": OWNER_AI_SYSTEM},
+                {"role": "user",   "content": command_text}
+            ],
+            temperature=0.1, max_tokens=200)
+        raw = resp.choices[0].message.content.strip()
+        # JSON extract করো
+        import json
+        raw = raw.replace("```json","").replace("```","").strip()
+        return json.loads(raw)
+    except Exception as e:
+        logger.error(f"Owner AI parse error: {e}")
+        return {"action": "unknown", "reply": "বুঝতে পারিনি, আবার বলো।"}
+
+
 async def handle_owner_control(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Owner private chat-এ password দিয়ে verify করলে
-    যেকোনো group control করতে পারবে।
+    যেকোনো group-কে AI natural language দিয়ে control করতে পারবে।
     Returns True if handled as owner command.
     """
     u    = update.effective_user
@@ -2561,16 +2613,14 @@ async def handle_owner_control(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
                 owner_target_group[u.id] = chat.id
                 await msg.reply_text(
                     f"✅ *Group নির্বাচিত:* {chat.title}\n\n"
-                    f"এখন command দাও। যেমন:\n"
-                    f"• `ban @username` — ব্যান করো\n"
-                    f"• `unban @username` — ব্যান তোলো\n"
-                    f"• `warn @username` — সতর্ক করো\n"
-                    f"• `kick @username` — বের করো\n"
-                    f"• `msg আমার বার্তা` — group-এ message পাঠাও\n"
-                    f"• `pin message_id` — message pin করো\n"
-                    f"• `aion` / `aioff` — AI চালু/বন্ধ\n"
-                    f"• `clearwarns` — সব warn মুছো\n"
-                    f"• `stop` — control বন্ধ করো",
+                    f"🤖 এখন স্বাভাবিক ভাষায় বলো কী করতে চাও।\n\n"
+                    f"*উদাহরণ:*\n"
+                    f"• \"ওই @username কে ban করো\"\n"
+                    f"• \"সবাইকে welcome জানাও\"\n"
+                    f"• \"AI চালু করে দাও\"\n"
+                    f"• \"@user কে warn দাও কারণ সে spam করছে\"\n"
+                    f"• \"group-এ বলো আজ কোনো link দেওয়া যাবে না\"\n"
+                    f"• \"stop\" — session শেষ করো",
                     parse_mode='Markdown'
                 )
                 return True
@@ -2578,78 +2628,116 @@ async def handle_owner_control(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
                 await msg.reply_text(f"❌ Group খুঁজে পাওয়া যায়নি: {e}")
                 return True
 
-        # ── Execute commands in target group ──
+        # ── AI দিয়ে natural language command execute করো ──
         if u.id in owner_target_group:
             chat_id = owner_target_group[u.id]
-            parts   = text.split(None, 1)
-            cmd     = parts[0].lower()
-            arg     = parts[1] if len(parts) > 1 else ''
 
-            if cmd == 'stop':
+            # "stop" সরাসরি check করো
+            if text.lower().strip() == 'stop':
                 owner_target_group.pop(u.id, None)
                 owner_verified.pop(u.id, None)
                 await msg.reply_text("✅ Owner control session শেষ।")
                 return True
 
-            elif cmd == 'aion':
+            # AI দিয়ে command parse করো
+            await ctx.bot.send_chat_action(update.effective_chat.id, "typing")
+            loop   = asyncio.get_event_loop()
+            parsed = await loop.run_in_executor(
+                executor, owner_ai_parse_sync, text)
+
+            action = parsed.get('action', 'unknown')
+            target = parsed.get('target', '')
+            reason = parsed.get('reason', '')
+            send_text = parsed.get('text', '')
+
+            if action == 'stop':
+                owner_target_group.pop(u.id, None)
+                owner_verified.pop(u.id, None)
+                await msg.reply_text("✅ Owner control session শেষ।")
+                return True
+
+            elif action == 'aion':
                 group_ai_on.add(chat_id)
                 await msg.reply_text("✅ Group AI চালু।")
                 try: await ctx.bot.send_message(chat_id, "🤖 AI assistant চালু হয়েছে।")
                 except: pass
-                return True
 
-            elif cmd == 'aioff':
+            elif action == 'aioff':
                 group_ai_on.discard(chat_id)
                 await msg.reply_text("✅ Group AI বন্ধ।")
                 try: await ctx.bot.send_message(chat_id, "🔕 AI assistant বন্ধ হয়েছে।")
                 except: pass
-                return True
 
-            elif cmd == 'clearwarns':
+            elif action == 'clearwarns':
                 keys = [k for k in group_warns if k[0] == chat_id]
                 for k in keys: group_warns.pop(k, None)
                 await msg.reply_text(f"✅ {len(keys)} জনের warn মুছা হয়েছে।")
-                return True
 
-            elif cmd == 'msg' and arg:
+            elif action == 'msg' and send_text:
                 try:
-                    await ctx.bot.send_message(chat_id, arg)
+                    await ctx.bot.send_message(chat_id, send_text)
                     await msg.reply_text("✅ Message পাঠানো হয়েছে।")
                 except Exception as e:
                     await msg.reply_text(f"❌ {e}")
-                return True
 
-            elif cmd in ('ban', 'kick', 'warn', 'unban') and arg:
-                username = arg.lstrip('@')
+            elif action in ('ban', 'kick', 'warn', 'unban') and target:
+                username = target.lstrip('@')
                 try:
-                    # Username → user_id
-                    member = await ctx.bot.get_chat_member(chat_id, f'@{username}')
-                    uid2   = member.user.id
-                    name   = member.user.first_name
+                    # Username বা ID দিয়ে member খোঁজো
+                    try:
+                        if username.isdigit():
+                            member = await ctx.bot.get_chat_member(chat_id, int(username))
+                        else:
+                            member = await ctx.bot.get_chat_member(chat_id, f'@{username}')
+                        uid2 = member.user.id
+                        name = member.user.first_name
+                    except Exception:
+                        await msg.reply_text(f"❌ @{username} কে খুঁজে পাওয়া যায়নি।")
+                        return True
 
-                    if cmd == 'ban':
+                    if action == 'ban':
                         await ctx.bot.ban_chat_member(chat_id, uid2)
-                        await msg.reply_text(f"🚫 {name} (@{username}) ব্যান করা হয়েছে।")
-                    elif cmd == 'kick':
+                        ban_msg = f"🚫 {name} কে ban করা হয়েছে।"
+                        if reason: ban_msg += f"\nকারণ: {reason}"
+                        await msg.reply_text(ban_msg)
+                        try: await ctx.bot.send_message(chat_id, ban_msg)
+                        except: pass
+
+                    elif action == 'kick':
                         await ctx.bot.ban_chat_member(chat_id, uid2)
                         await ctx.bot.unban_chat_member(chat_id, uid2)
-                        await msg.reply_text(f"👢 {name} (@{username}) কিক করা হয়েছে।")
-                    elif cmd == 'unban':
+                        kick_msg = f"👢 {name} কে kick করা হয়েছে।"
+                        if reason: kick_msg += f"\nকারণ: {reason}"
+                        await msg.reply_text(kick_msg)
+                        try: await ctx.bot.send_message(chat_id, kick_msg)
+                        except: pass
+
+                    elif action == 'unban':
                         await ctx.bot.unban_chat_member(chat_id, uid2, only_if_banned=True)
-                        await msg.reply_text(f"✅ {name} (@{username}) ব্যান তোলা হয়েছে।")
-                    elif cmd == 'warn':
+                        await msg.reply_text(f"✅ {name} এর ban তোলা হয়েছে।")
+
+                    elif action == 'warn':
                         key = (chat_id, uid2)
                         group_warns[key] = group_warns.get(key, 0) + 1
                         wc = group_warns[key]
-                        notif = await ctx.bot.send_message(
-                            chat_id,
-                            f"⚠️ {name} — Owner কর্তৃক সতর্কতা ({wc}/3)")
+                        warn_msg = f"⚠️ {name} — সতর্কতা ({wc}/3)"
+                        if reason: warn_msg += f"\nকারণ: {reason}"
+                        notif = await ctx.bot.send_message(chat_id, warn_msg)
                         asyncio.create_task(
                             auto_delete_after(ctx.bot, chat_id, notif.message_id, 30))
-                        await msg.reply_text(f"⚠️ {name} warn করা হয়েছে ({wc}/3)।")
+                        await msg.reply_text(f"⚠️ {name} কে warn দেওয়া হয়েছে ({wc}/3)।")
+
                 except Exception as e:
                     await msg.reply_text(f"❌ সমস্যা: {e}")
-                return True
+
+            elif action == 'unknown':
+                reply_txt = parsed.get('reply', 'কী করতে চাও বুঝতে পারিনি। আবার বলো।')
+                await msg.reply_text(f"🤔 {reply_txt}")
+
+            else:
+                await msg.reply_text("🤔 কী করতে চাও পরিষ্কারভাবে বলো।")
+
+            return True
 
     return False
 
