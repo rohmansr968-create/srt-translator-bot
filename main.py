@@ -2280,6 +2280,10 @@ warn_reasons   = {}
 # { user_id: {'chat_id': ..., 'name': ..., 'forgiven': False} }
 kicked_users   = {}
 
+# নাম → user_id ক্যাশ (group message থেকে তৈরি)
+# { (chat_id, name_lower): user_id }
+name_id_cache  = {}
+
 MAX_GROUP_HIST = 20   # প্রতি ইউজারের সর্বোচ্চ history
 WORDS_PER_MIN  = 200  # পড়ার গড় speed (words/min)
 
@@ -2432,6 +2436,12 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
+    # নাম→ID ক্যাশ আপডেট করো
+    if user.first_name:
+        name_id_cache[(chat_id, user.first_name.lower())] = user.id
+    if user.username:
+        name_id_cache[(chat_id, user.username.lower())] = user.id
+
     loop = asyncio.get_event_loop()
 
     # ── Step 1: Obscene check ──
@@ -2533,52 +2543,82 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # 👑  OWNER GROUP CONTROL
 # ══════════════════════════════════════════════
 
-OWNER_AI_SYSTEM = """তুমি একটি Telegram group bot-এর AI assistant।
-Owner তোমাকে বাংলা বা English-এ যা বলবে, তুমি সেটা বিশ্লেষণ করে একটি JSON action তৈরি করবে।
+OWNER_AI_SYSTEM = """তুমি একটি Telegram group-এর স্মার্ট AI assistant। তুমি group owner-এর personal assistant।
+Owner তোমাকে বাংলা বা English-এ যা বলবে সেটা বুঝে JSON action তৈরি করবে।
 
-Available actions:
-- ban: username বা user_id দিয়ে কাউকে ban করো
-- unban: কাউকে unban করো
-- kick: কাউকে kick করো (ban + unban)
-- warn: কাউকে warn দাও
-- msg: group-এ message পাঠাও
+তোমাকে VERY SMART হতে হবে। Owner যা বলে তার মানে বুঝতে হবে, শুধু keyword দেখলে হবে না।
+
+Actions তুমি করতে পারো:
+- ban: কাউকে ban করো (target দরকার)
+- unban: কাউকে unban করো (target দরকার)
+- kick: কাউকে kick করো (target দরকার)
+- warn: কাউকে warn দাও (target দরকার)
+- msg: group-এ যেকোনো message পাঠাও (text দরকার)
 - aion: group AI চালু করো
 - aioff: group AI বন্ধ করো
 - clearwarns: সব warn মুছো
-- stop: owner session শেষ করো
-- unknown: কী বলতে চাইছে বোঝা যাচ্ছে না
+- stop: session শেষ করো
 
-Reply ONLY with valid JSON like:
+msg action-এর জন্য text তুমি নিজে তৈরি করতে পারবে। যেমন:
+- "গ্রুপের নিয়ম জানাও" → নিজে সুন্দর নিয়মের list তৈরি করে text-এ দাও
+- "সবাইকে welcome জানাও" → সুন্দর welcome message তৈরি করো
+- "সতর্ক করে দাও" → সতর্কতার message তৈরি করো
+- "ঘোষণা দাও যে..." → সেই ঘোষণা লিখে পাঠাও
+
+Reply ONLY with valid JSON — no explanation, no markdown:
 {"action": "ban", "target": "@username", "reason": "কারণ"}
-{"action": "msg", "text": "group-এ পাঠানোর বার্তা"}
+{"action": "msg", "text": "group-এ পাঠানোর সম্পূর্ণ বার্তা"}
 {"action": "aion"}
 {"action": "stop"}
-{"action": "unknown", "reply": "বাংলায় জিজ্ঞেস করো কী করতে চান"}
 
-Rules:
-- target: @username অথবা user_id number
-- text: যা group-এ পাঠাতে হবে
-- No markdown, no explanation, ONLY JSON"""
+Important rules:
+- target: @username অথবা user_id number অথবা শুধু নাম (যা owner বলেছে)
+- text-এ সুন্দর formatted বাংলা message লিখবে, emoji ব্যবহার করবে
+- কখনো "unknown" দেবে না — সব কিছুই কোনো না কোনো action-এ map করো
+- যদি সত্যিই বুঝতে না পারো শুধু তখন: {"action": "unknown", "reply": "কারণ বাংলায়"}"""
+
+# Owner-এর conversation history (session-based)
+# { user_id: [ {role, content}, ... ] }
+owner_chat_history = {}
+MAX_OWNER_HIST = 30
 
 
-def owner_ai_parse_sync(command_text: str) -> dict:
-    """Owner-এর natural language command AI দিয়ে parse করো"""
+def owner_ai_parse_sync(owner_id: int, command_text: str) -> dict:
+    """Owner-এর natural language command AI দিয়ে parse করো — history সহ"""
+    import json
+
+    if owner_id not in owner_chat_history:
+        owner_chat_history[owner_id] = []
+
+    # History-তে নতুন message যোগ করো
+    owner_chat_history[owner_id].append({"role": "user", "content": command_text})
+    if len(owner_chat_history[owner_id]) > MAX_OWNER_HIST:
+        owner_chat_history[owner_id] = owner_chat_history[owner_id][-MAX_OWNER_HIST:]
+
     try:
         resp = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": OWNER_AI_SYSTEM},
-                {"role": "user",   "content": command_text}
-            ],
-            temperature=0.1, max_tokens=200)
+            messages=[{"role": "system", "content": OWNER_AI_SYSTEM}]
+                     + owner_chat_history[owner_id],
+            temperature=0.2, max_tokens=600)
         raw = resp.choices[0].message.content.strip()
-        # JSON extract করো
-        import json
         raw = raw.replace("```json","").replace("```","").strip()
-        return json.loads(raw)
+
+        # JSON parse করো
+        result = json.loads(raw)
+
+        # AI-এর response history-তে রাখো
+        owner_chat_history[owner_id].append({"role": "assistant", "content": raw})
+        return result
+
+    except json.JSONDecodeError:
+        # JSON না হলে msg হিসেবে পাঠাও
+        logger.warning(f"Owner AI non-JSON response: {raw[:100]}")
+        owner_chat_history[owner_id].append({"role": "assistant", "content": raw})
+        return {"action": "msg", "text": raw}
     except Exception as e:
         logger.error(f"Owner AI parse error: {e}")
-        return {"action": "unknown", "reply": "বুঝতে পারিনি, আবার বলো।"}
+        return {"action": "unknown", "reply": "AI সমস্যা হয়েছে, আবার চেষ্টা করো।"}
 
 
 async def handle_owner_control(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -2636,6 +2676,7 @@ async def handle_owner_control(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
             if text.lower().strip() == 'stop':
                 owner_target_group.pop(u.id, None)
                 owner_verified.pop(u.id, None)
+                owner_chat_history.pop(u.id, None)   # history মুছো
                 await msg.reply_text("✅ Owner control session শেষ।")
                 return True
 
@@ -2643,7 +2684,7 @@ async def handle_owner_control(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
             await ctx.bot.send_chat_action(update.effective_chat.id, "typing")
             loop   = asyncio.get_event_loop()
             parsed = await loop.run_in_executor(
-                executor, owner_ai_parse_sync, text)
+                executor, owner_ai_parse_sync, u.id, text)
 
             action = parsed.get('action', 'unknown')
             target = parsed.get('target', '')
@@ -2653,6 +2694,7 @@ async def handle_owner_control(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
             if action == 'stop':
                 owner_target_group.pop(u.id, None)
                 owner_verified.pop(u.id, None)
+                owner_chat_history.pop(u.id, None)
                 await msg.reply_text("✅ Owner control session শেষ।")
                 return True
 
@@ -2683,16 +2725,38 @@ async def handle_owner_control(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
             elif action in ('ban', 'kick', 'warn', 'unban') and target:
                 username = target.lstrip('@')
                 try:
-                    # Username বা ID দিয়ে member খোঁজো
+                    # Username বা ID বা নাম দিয়ে member খোঁজো
                     try:
                         if username.isdigit():
                             member = await ctx.bot.get_chat_member(chat_id, int(username))
+                        elif username.startswith('@') or '_' in username or username.isascii():
+                            # @username বা English name চেষ্টা করো
+                            try:
+                                member = await ctx.bot.get_chat_member(chat_id, f'@{username}')
+                            except Exception:
+                                # Cache থেকে নাম দিয়ে খোঁজো
+                                cached_id = name_id_cache.get((chat_id, username.lower()))
+                                if cached_id:
+                                    member = await ctx.bot.get_chat_member(chat_id, cached_id)
+                                else:
+                                    raise
                         else:
-                            member = await ctx.bot.get_chat_member(chat_id, f'@{username}')
+                            # বাংলা বা যেকোনো নাম — cache থেকে খোঁজো
+                            cached_id = name_id_cache.get((chat_id, username.lower()))
+                            if cached_id:
+                                member = await ctx.bot.get_chat_member(chat_id, cached_id)
+                            else:
+                                await msg.reply_text(
+                                    f"❌ \"{username}\" নামের কেউ পাওয়া যায়নি।\n"
+                                    f"💡 তারা group-এ অন্তত একটা message করলে বট চিনতে পারবে।\n"
+                                    f"অথবা @username বা user ID দাও।")
+                                return True
                         uid2 = member.user.id
                         name = member.user.first_name
                     except Exception:
-                        await msg.reply_text(f"❌ @{username} কে খুঁজে পাওয়া যায়নি।")
+                        await msg.reply_text(
+                            f"❌ \"{username}\" কে খুঁজে পাওয়া যায়নি।\n"
+                            f"💡 @username অথবা user ID দিয়ে চেষ্টা করো।")
                         return True
 
                     if action == 'ban':
