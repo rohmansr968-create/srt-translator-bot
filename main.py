@@ -53,7 +53,10 @@ for _a in ADMIN_IDS_STR.split(','):
     try: ADMIN_IDS.add(int(_a.strip()))
     except: pass
 
-OWNER_ID = 8334219263   # Bot owner
+OWNER_ID       = 8334219263   # Bot owner
+OWNER_PASSWORD = "Bot11s"      # Owner verification password
+owner_verified = {}            # {uid: True} — verified owner sessions
+owner_target_group = {}        # {uid: chat_id} — which group owner is controlling
 
 WELCOME_TOKENS = 50
 DAILY_TOKENS   = 10
@@ -1953,6 +1956,12 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_group_message(update, ctx)
         return
 
+    # Owner control check (FIRST — before anything else)
+    if u.id == OWNER_ID:
+        handled = await handle_owner_control(update, ctx)
+        if handled:
+            return
+
     # Kicked user private DM check
     if u.id in kicked_users:
         await handle_kicked_user_dm(update, ctx)
@@ -2291,12 +2300,15 @@ OBSCENE_SYSTEM = (
 )
 
 FORGIVE_SYSTEM = (
-    "তুমি একটি গ্রুপের AI moderator। "
-    "একজন ব্যবহারকারী ক্ষমা চাইছে কারণ সে গ্রুপ থেকে বের করা হয়েছে। "
-    "তার ক্ষমার আবেদন পড়ে সিদ্ধান্ত নাও — সত্যিকারের অনুতাপ আছে কিনা। "
-    "যদি সত্যিই অনুতাপী মনে হয় তাহলে reply শুরু করো FORGIVEN দিয়ে। "
-    "নইলে reply শুরু করো DENIED দিয়ে। "
-    "তারপর বাংলায় সংক্ষিপ্ত বার্তা দাও।"
+    "You are a strict AI moderator for a group chat. "
+    "A user was kicked for rule violations and is now apologizing. "
+    "Be VERY critical and analyze the apology carefully. "
+    "Only forgive if the apology is: deeply sincere, specific about what they did wrong, "
+    "shows genuine remorse, and promises to change. "
+    "Reject if: the apology is vague, manipulative, sarcastic, "
+    "just says 'sorry' without explanation, or seems fake. "
+    "Reply ONLY with: FORGIVEN or DENIED on the first line. "
+    "Then write a SHORT response in Bengali explaining your decision."
 )
 
 
@@ -2515,6 +2527,134 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════
+# 👑  OWNER GROUP CONTROL
+# ══════════════════════════════════════════════
+async def handle_owner_control(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Owner private chat-এ password দিয়ে verify করলে
+    যেকোনো group control করতে পারবে।
+    Returns True if handled as owner command.
+    """
+    u    = update.effective_user
+    msg  = update.message
+    text = msg.text.strip()
+
+    # ── Password verification ──
+    if text == OWNER_PASSWORD and u.id == OWNER_ID:
+        owner_verified[u.id] = True
+        await msg.reply_text(
+            "✅ *Owner verified!*\n\n"
+            "এখন যে group control করতে চাও সেটার handle দাও।\n"
+            "যেমন: `@groupname` অথবা group link পাঠাও।",
+            parse_mode='Markdown'
+        )
+        return True
+
+    # ── Group selection ──
+    if owner_verified.get(u.id) and u.id == OWNER_ID:
+        # Check if it's a group handle or link
+        if text.startswith('@') or 't.me/' in text:
+            try:
+                handle = text.replace('https://','').replace('http://','')
+                handle = handle.replace('t.me/','@')
+                chat = await ctx.bot.get_chat(handle)
+                owner_target_group[u.id] = chat.id
+                await msg.reply_text(
+                    f"✅ *Group নির্বাচিত:* {chat.title}\n\n"
+                    f"এখন command দাও। যেমন:\n"
+                    f"• `ban @username` — ব্যান করো\n"
+                    f"• `unban @username` — ব্যান তোলো\n"
+                    f"• `warn @username` — সতর্ক করো\n"
+                    f"• `kick @username` — বের করো\n"
+                    f"• `msg আমার বার্তা` — group-এ message পাঠাও\n"
+                    f"• `pin message_id` — message pin করো\n"
+                    f"• `aion` / `aioff` — AI চালু/বন্ধ\n"
+                    f"• `clearwarns` — সব warn মুছো\n"
+                    f"• `stop` — control বন্ধ করো",
+                    parse_mode='Markdown'
+                )
+                return True
+            except Exception as e:
+                await msg.reply_text(f"❌ Group খুঁজে পাওয়া যায়নি: {e}")
+                return True
+
+        # ── Execute commands in target group ──
+        if u.id in owner_target_group:
+            chat_id = owner_target_group[u.id]
+            parts   = text.split(None, 1)
+            cmd     = parts[0].lower()
+            arg     = parts[1] if len(parts) > 1 else ''
+
+            if cmd == 'stop':
+                owner_target_group.pop(u.id, None)
+                owner_verified.pop(u.id, None)
+                await msg.reply_text("✅ Owner control session শেষ।")
+                return True
+
+            elif cmd == 'aion':
+                group_ai_on.add(chat_id)
+                await msg.reply_text("✅ Group AI চালু।")
+                try: await ctx.bot.send_message(chat_id, "🤖 AI assistant চালু হয়েছে।")
+                except: pass
+                return True
+
+            elif cmd == 'aioff':
+                group_ai_on.discard(chat_id)
+                await msg.reply_text("✅ Group AI বন্ধ।")
+                try: await ctx.bot.send_message(chat_id, "🔕 AI assistant বন্ধ হয়েছে।")
+                except: pass
+                return True
+
+            elif cmd == 'clearwarns':
+                keys = [k for k in group_warns if k[0] == chat_id]
+                for k in keys: group_warns.pop(k, None)
+                await msg.reply_text(f"✅ {len(keys)} জনের warn মুছা হয়েছে।")
+                return True
+
+            elif cmd == 'msg' and arg:
+                try:
+                    await ctx.bot.send_message(chat_id, arg)
+                    await msg.reply_text("✅ Message পাঠানো হয়েছে।")
+                except Exception as e:
+                    await msg.reply_text(f"❌ {e}")
+                return True
+
+            elif cmd in ('ban', 'kick', 'warn', 'unban') and arg:
+                username = arg.lstrip('@')
+                try:
+                    # Username → user_id
+                    member = await ctx.bot.get_chat_member(chat_id, f'@{username}')
+                    uid2   = member.user.id
+                    name   = member.user.first_name
+
+                    if cmd == 'ban':
+                        await ctx.bot.ban_chat_member(chat_id, uid2)
+                        await msg.reply_text(f"🚫 {name} (@{username}) ব্যান করা হয়েছে।")
+                    elif cmd == 'kick':
+                        await ctx.bot.ban_chat_member(chat_id, uid2)
+                        await ctx.bot.unban_chat_member(chat_id, uid2)
+                        await msg.reply_text(f"👢 {name} (@{username}) কিক করা হয়েছে।")
+                    elif cmd == 'unban':
+                        await ctx.bot.unban_chat_member(chat_id, uid2, only_if_banned=True)
+                        await msg.reply_text(f"✅ {name} (@{username}) ব্যান তোলা হয়েছে।")
+                    elif cmd == 'warn':
+                        key = (chat_id, uid2)
+                        group_warns[key] = group_warns.get(key, 0) + 1
+                        wc = group_warns[key]
+                        notif = await ctx.bot.send_message(
+                            chat_id,
+                            f"⚠️ {name} — Owner কর্তৃক সতর্কতা ({wc}/3)")
+                        asyncio.create_task(
+                            auto_delete_after(ctx.bot, chat_id, notif.message_id, 30))
+                        await msg.reply_text(f"⚠️ {name} warn করা হয়েছে ({wc}/3)।")
+                except Exception as e:
+                    await msg.reply_text(f"❌ সমস্যা: {e}")
+                return True
+
+    return False
+
+
+# ══════════════════════════════════════════════
 # 💌  PRIVATE DM — Forgiveness Handler
 # ══════════════════════════════════════════════
 async def handle_kicked_user_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2534,7 +2674,8 @@ async def handle_kicked_user_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if info.get('forgiven'):
         await msg.reply_text(
-            "Already forgiven once. No more chances."
+            "🚫 তোমাকে আগেই একবার ক্ষমা করা হয়েছিল।\n"
+            "এই সুযোগ আর নেই।"
         )
         return
 
