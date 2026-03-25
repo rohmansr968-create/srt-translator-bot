@@ -2284,38 +2284,51 @@ kicked_users   = {}
 # { (chat_id, name_lower): user_id }
 name_id_cache  = {}
 
-MAX_GROUP_HIST = 20   # প্রতি ইউজারের সর্বোচ্চ history
+MAX_GROUP_HIST = 60   # গ্রুপের shared history (সবার মেসেজ একসাথে)
 WORDS_PER_MIN  = 200  # পড়ার গড় speed (words/min)
 
 GROUP_AI_SYSTEM = (
-    "তুমি একটি গ্রুপ চ্যাটের AI সহকারী। "
+    "তুমি '{group_name}' গ্রুপের একজন AI admin ও সদস্য — নাম Lumira। "
+    "তুমি এই গ্রুপের সাথে সংযুক্ত এবং সবার কথোপকথন জানো। "
     "বাংলায় সহজ ও বন্ধুত্বপূর্ণভাবে উত্তর দাও। "
     "সংক্ষিপ্ত কিন্তু সহায়ক উত্তর দাও। "
-    "প্রয়োজনে English ব্যবহার করতে পারো। "
-    "আগের কথোপকথন মনে রেখে consistent উত্তর দাও।"
+    "গ্রুপের আগের conversation মনে রেখে সঠিক উত্তর দাও — "
+    "কেউ জিজ্ঞেস করলে অন্য member কী বলেছে সেটা বলতে পারবে। "
+    "প্রয়োজনে English ব্যবহার করতে পারো।"
 )
 
-OBSCENE_SYSTEM = (
-    "You are a content moderator. "
-    "Analyze the given message and determine if it contains: "
-    "sexual content, extreme profanity, hate speech, harassment, or explicit material. "
-    "Reply with ONLY: CLEAN or OBSCENE "
-    "Nothing else."
-)
+# forgiveness কতবার হয়েছে track করো
+# { user_id: count }  — 0=first time, 1=second, 2=third
+forgive_attempt_count = {}
 
-FORGIVE_SYSTEM = (
-    "You are a warm and compassionate AI moderator for a Bengali group chat. "
-    "A user was kicked for bad language and is now sincerely apologizing. "
-    "Be VERY FORGIVING and EMPATHETIC — humans make mistakes and deserve second chances. "
-    "ALWAYS FORGIVE if the user: expresses any remorse, promises not to repeat, "
-    "sounds emotional or distressed, or shows they understand what they did wrong. "
-    "Even a simple heartfelt apology should be enough to FORGIVE. "
-    "ONLY DENY if the apology is clearly fake, mocking, or disrespectful. "
-    "Reply ONLY with: FORGIVEN or DENIED on the first line. "
-    "Then write a SHORT warm encouraging response in Bengali. "
-    "If FORGIVEN: be warm, joyful, and welcoming — tell them everyone deserves a second chance. "
-    "If DENIED: briefly explain why but keep the door open."
-)
+FORGIVE_SYSTEMS = [
+    # ১ম বার — খুব সহজে ক্ষমা
+    (
+        "You are a warm and compassionate AI moderator for a Bengali group chat. "
+        "This is the user's FIRST offense. Be very forgiving and empathetic. "
+        "ALWAYS FORGIVE if there is any sign of remorse or apology, even a simple one. "
+        "Reply ONLY: FORGIVEN or DENIED on line 1. "
+        "Then a short warm Bengali message welcoming them back."
+    ),
+    # ২য় বার — মাঝারি কঠিন
+    (
+        "You are a firm AI moderator for a Bengali group chat. "
+        "This user has broken rules TWICE before. Be more strict this time. "
+        "Only forgive if the apology is detailed, sincere, and shows clear understanding of the mistake. "
+        "A simple sorry is NOT enough. They must explain specifically what they did wrong and promise firmly. "
+        "Reply ONLY: FORGIVEN or DENIED on line 1. "
+        "Then a short Bengali message — if forgiven, warn this is their last chance; if denied, say why."
+    ),
+    # ৩য় বার — খুব কঠিন
+    (
+        "You are a very strict AI moderator for a Bengali group chat. "
+        "This user has broken rules THREE or more times. Do NOT forgive easily. "
+        "Only forgive in extraordinary circumstances with a very detailed, heartfelt, specific apology. "
+        "Most likely DENY. If denied, tell them to contact the group admin directly. "
+        "Reply ONLY: FORGIVEN or DENIED on line 1. "
+        "Then a short Bengali message. If DENIED, say they should contact the admin for further help."
+    ),
+]
 
 
 def calc_read_time(text: str) -> float:
@@ -2342,68 +2355,89 @@ def is_obscene_sync(text: str) -> bool:
 
 
 def group_ai_reply_sync(chat_id: int, user_id: int,
-                         user_name: str, text: str) -> str:
+                         user_name: str, text: str,
+                         group_name: str = "গ্রুপ") -> str:
     """
-    প্রতিটি ইউজারের আলাদা history রেখে AI reply দাও।
+    গ্রুপের shared history ব্যবহার করে AI reply দাও।
+    সবার কথোপকথন একসাথে থাকে — bot জানে কে কী বলেছে।
     """
-    key = (chat_id, user_id)
-    if key not in group_history:
-        group_history[key] = []
+    # Shared history — chat_id দিয়ে (user_id নয়)
+    if chat_id not in group_history:
+        group_history[chat_id] = []
 
-    group_history[key].append({"role": "user", "content": f"{user_name}: {text}"})
+    # "Name: message" ফরম্যাটে রাখো যাতে bot জানে কে বলেছে
+    group_history[chat_id].append({
+        "role": "user",
+        "content": f"{user_name}: {text}"
+    })
+
     # Max history বজায় রাখো
-    if len(group_history[key]) > MAX_GROUP_HIST:
-        group_history[key] = group_history[key][-MAX_GROUP_HIST:]
+    if len(group_history[chat_id]) > MAX_GROUP_HIST:
+        group_history[chat_id] = group_history[chat_id][-MAX_GROUP_HIST:]
 
     # Warn context যোগ করো system prompt-এ
+    key   = (chat_id, user_id)
     warns = warn_reasons.get(key, [])
-    sys_prompt = GROUP_AI_SYSTEM
+    sys_prompt = GROUP_AI_SYSTEM.replace('{group_name}', group_name)
     if warns:
         sys_prompt += (
-            f" এই ইউজারকে আগে সতর্ক করা হয়েছিল কারণ: {', '.join(warns[-3:])}।"
-            f" যদি সে জানতে চায় কেন warning দিয়েছিলে, বলো।"
+            f" বিশেষ দ্রষ্টব্য: {user_name} কে আগে সতর্ক করা হয়েছিল কারণ: {', '.join(warns[-3:])}।"
         )
 
     try:
         resp = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "system", "content": sys_prompt}]
-                     + group_history[key],
+                     + group_history[chat_id],
             temperature=0.7, max_tokens=512)
         reply = resp.choices[0].message.content.strip()
-        # AI reply-ও history-তে রাখো
-        group_history[key].append({"role": "assistant", "content": reply})
+        # AI reply-ও shared history-তে রাখো
+        group_history[chat_id].append({"role": "assistant", "content": reply})
         return reply
     except Exception as e:
         if _iq(e): return "⚠️ API limit শেষ।"
         return ""
 
 
-def check_forgiveness_sync(user_name: str, apology_text: str,
-                             kick_reasons: list) -> tuple:
+def check_forgiveness_sync(user_id: int, user_name: str,
+                             apology_text: str, kick_reasons: list,
+                             admin_contact: str = "") -> tuple:
     """
-    ক্ষমার আবেদন যাচাই করো।
+    ক্ষমার আবেদন যাচাই করো — progressive strictness।
     Returns: (forgiven: bool, reply_text: str)
     """
+    attempt = forgive_attempt_count.get(user_id, 0)
+    # যত attempt বেশি তত কঠিন system নাও (max index 2)
+    sys_idx = min(attempt, 2)
+    forgive_sys = FORGIVE_SYSTEMS[sys_idx]
+
     reasons_str = ", ".join(kick_reasons) if kick_reasons else "গ্রুপের নিয়ম লঙ্ঘন"
     prompt = (
-        f"{user_name} was kicked for: {reasons_str}.\n"
-        f"Now they say: {apology_text}"
+        f"User name: {user_name}\n"
+        f"Offense number: {attempt + 1}\n"
+        f"Kicked for: {reasons_str}\n"
+        f"Their apology: {apology_text}"
     )
     try:
         resp = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": FORGIVE_SYSTEM},
+                {"role": "system", "content": forgive_sys},
                 {"role": "user",   "content": prompt}
             ],
-            temperature=0.4, max_tokens=256)
+            temperature=0.3, max_tokens=300)
         reply = resp.choices[0].message.content.strip()
         forgiven = reply.upper().startswith("FORGIVEN")
-        # FORGIVEN/DENIED prefix বাদ দিয়ে বার্তা নাও
         clean_reply = reply.replace("FORGIVEN", "").replace("DENIED", "").strip()
         if not clean_reply:
             clean_reply = "আবেদন পর্যালোচনা করা হয়েছে।"
+
+        # ৩য় বা তার বেশি attempt-এ DENY হলে admin contact যোগ করো
+        if not forgiven and attempt >= 2 and admin_contact:
+            clean_reply += (
+                f"\n\n📞 *আরো সাহায্যের জন্য group admin-এর সাথে যোগাযোগ করো:*\n"
+                f"{admin_contact}"
+            )
         return forgiven, clean_reply
     except Exception:
         return False, "এই মুহূর্তে যাচাই করা সম্ভব হয়নি।"
@@ -2477,6 +2511,8 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     'reasons':  reasons,
                     'forgiven': False,
                 }
+                # নতুন kick = attempt count রিসেট করো না,
+                # পুরনো count রাখো যাতে পরের ক্ষমা আরো কঠিন হয়
                 warn_reasons.pop(key, None)
 
                 # Group-এ kick notification
@@ -2523,9 +2559,11 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ctx.bot.send_chat_action(chat_id, "typing")
 
     user_name  = user.first_name or user.username or "Someone"
+    # Group নাম নাও
+    group_name = msg.chat.title or "গ্রুপ"
     reply_text = await loop.run_in_executor(
         executor,
-        functools.partial(group_ai_reply_sync, chat_id, user.id, user_name, text)
+        functools.partial(group_ai_reply_sync, chat_id, user.id, user_name, text, group_name)
     )
 
     if reply_text:
@@ -2812,7 +2850,7 @@ async def handle_owner_control(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
 async def handle_kicked_user_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     Kick হওয়া ইউজার private-এ বটকে message করলে
-    ক্ষমার আবেদন process করো।
+    ক্ষমার আবেদন process করো — progressive strictness।
     """
     msg  = update.message
     if not msg or not msg.text: return
@@ -2824,59 +2862,84 @@ async def handle_kicked_user_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     info = kicked_users[u.id]
 
+    # ৩য়+ attempt-এ already denied হলে সরাসরি admin পাঠাও
+    attempt = forgive_attempt_count.get(u.id, 0)
     if info.get('forgiven'):
         await msg.reply_text(
-            "🚫 তোমাকে আগেই একবার ক্ষমা করা হয়েছিল।\n"
-            "এই সুযোগ আর নেই।"
+            "✅ তোমাকে আগেই ক্ষমা করা হয়েছে এবং group-এ ফিরে যাওয়ার সুযোগ দেওয়া হয়েছে।"
         )
         return
 
-    # ক্ষমার আবেদন যাচাই করো
+    if attempt >= 3:
+        # ৩ বারের বেশি — আর ক্ষমা নেই
+        admin_id = OWNER_ID
+        await msg.reply_text(
+            "🚫 *তোমার ক্ষমার সুযোগ শেষ হয়ে গেছে।*\n\n"
+            f"তুমি ইতিমধ্যে ৩ বার নিয়ম ভেঙেছ। AI আর ক্ষমা করতে পারবে না।\n\n"
+            f"📞 *Group Admin-এর সাথে যোগাযোগ করো:*\n"
+            f"Admin ID: `{admin_id}`\n"
+            f"তাকে সরাসরি message করো এবং তোমার বিষয়টা ব্যাখ্যা করো।",
+            parse_mode='Markdown'
+        )
+        return
+
+    # Attempt count বাড়াও
+    forgive_attempt_count[u.id] = attempt + 1
+
+    # কতবার চেষ্টা হচ্ছে জানাও
+    attempt_labels = ["প্রথমবার", "দ্বিতীয়বার", "তৃতীয়বার"]
+    attempt_label  = attempt_labels[min(attempt, 2)]
+
     await ctx.bot.send_chat_action(msg.chat_id, "typing")
     loop = asyncio.get_event_loop()
+
+    # Admin contact তৈরি করো
+    admin_contact = f"Bot Owner ID: `{OWNER_ID}`"
+
     forgiven, reply = await loop.run_in_executor(
         executor,
         functools.partial(
             check_forgiveness_sync,
+            u.id,
             u.first_name,
             text,
-            info.get('reasons', [])
+            info.get('reasons', []),
+            admin_contact
         )
     )
 
     if forgiven:
         info['forgiven'] = True
         try:
-            # Ban তুলে নাও
             await ctx.bot.unban_chat_member(
                 info['chat_id'], u.id,
                 only_if_banned=True)
 
-            # Group-এ ফিরে আসার invitation
             try:
                 invite = await ctx.bot.create_chat_invite_link(
                     info['chat_id'],
                     member_limit=1,
-                    expire_date=int(time.time()) + 3600  # ১ ঘণ্টা valid
+                    expire_date=int(time.time()) + 3600
                 )
                 invite_link = invite.invite_link
             except Exception:
                 invite_link = None
 
-            dm_reply = (
-                "\u2705 *Your forgiveness request has been accepted.*\n\n"
-                f"_{reply}_\n\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            )
+            # ১ম বার vs পরের বার আলাদা message
+            if attempt == 0:
+                header = "✅ *ক্ষমার আবেদন গৃহীত হয়েছে।*"
+            else:
+                header = f"✅ *{attempt_label} চেষ্টায় ক্ষমা পেয়েছ — এটাই শেষ সুযোগ।*"
+
+            dm_reply = f"{header}\n\n_{reply}_\n\n━━━━━━━━━━━━━━━━━━━━━\n"
             if invite_link:
                 dm_reply += (
-                    f"\U0001f517 To rejoin the group, use this link: {invite_link}\n"
-                    f"_(valid for 1 hour)_"
+                    f"🔗 Group-এ ফিরে যাও: {invite_link}\n"
+                    f"_(১ ঘণ্টার মধ্যে যোগ দাও)_"
                 )
 
             await msg.reply_text(dm_reply, parse_mode='Markdown')
 
-            # Group-এ notification
             try:
                 await ctx.bot.send_message(
                     info['chat_id'],
@@ -2889,8 +2952,16 @@ async def handle_kicked_user_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Unban failed: {e}")
             await msg.reply_text("❌ Ban তুলতে সমস্যা হয়েছে। Admin-কে জানাও।")
     else:
+        # Denied — remaining attempts জানাও
+        remaining = max(0, 3 - forgive_attempt_count.get(u.id, 1))
+        extra = ""
+        if remaining > 0:
+            extra = f"\n\n_আরো {remaining} বার চেষ্টা করতে পারবে।_"
+        else:
+            extra = f"\n\n🚫 _আর কোনো সুযোগ নেই। Admin-এর সাথে যোগাযোগ করো।_"
+
         await msg.reply_text(
-            f"\u274c Forgiveness denied. {reply}",
+            f"❌ *ক্ষমার আবেদন প্রত্যাখ্যাত।*\n\n{reply}{extra}",
             parse_mode='Markdown'
         )
 
