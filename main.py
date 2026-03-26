@@ -2571,7 +2571,6 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ctx.bot.send_chat_action(chat_id, "typing")
 
     user_name  = user.first_name or user.username or "Someone"
-    # Group নাম নাও
     group_name = msg.chat.title or "গ্রুপ"
     reply_text = await loop.run_in_executor(
         executor,
@@ -2581,7 +2580,6 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if reply_text:
         try:
             sent = await msg.reply_text(reply_text)
-            # পড়ার সময় হিসাব করে auto-delete
             read_time = calc_read_time(reply_text)
             asyncio.create_task(
                 auto_delete_after(ctx.bot, chat_id, sent.message_id, read_time))
@@ -2859,10 +2857,50 @@ async def handle_owner_control(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
 # ══════════════════════════════════════════════
 # 💌  PRIVATE DM — Forgiveness Handler
 # ══════════════════════════════════════════════
+# Kick হওয়া ইউজারের AI conversation history
+# { user_id: [ {role, content}, ... ] }
+kicked_user_chat_history = {}
+
+KICKED_AI_SYSTEM = (
+    "তুমি একটি Telegram group-এর AI moderator। "
+    "একজন user গ্রুপের নিয়ম বারবার ভেঙে permanent ban হয়ে গেছে। "
+    "সে এখন তোমার সাথে কথা বলছে। "
+    "তুমি তার সাথে সহানুভূতি দিয়ে কথা বলবে, কিন্তু clearly জানাবে যে "
+    "AI এর পক্ষে আর ক্ষমা করা সম্ভব নয় — এই সিদ্ধান্ত final। "
+    "সে যা-ই বলুক, তুমি তাকে group admin-এর সাথে যোগাযোগ করতে বলবে। "
+    "বাংলায় কথা বলো। সংক্ষিপ্ত উত্তর দাও।"
+)
+
+
+def kicked_ai_chat_sync(user_id: int, user_name: str, text: str, admin_link: str) -> str:
+    """Permanent ban হওয়া user-এর সাথে AI conversation"""
+    if user_id not in kicked_user_chat_history:
+        kicked_user_chat_history[user_id] = []
+
+    kicked_user_chat_history[user_id].append({"role": "user", "content": text})
+    if len(kicked_user_chat_history[user_id]) > 20:
+        kicked_user_chat_history[user_id] = kicked_user_chat_history[user_id][-20:]
+
+    sys = KICKED_AI_SYSTEM + f" Group admin-এর link: {admin_link}"
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "system", "content": sys}]
+                     + kicked_user_chat_history[user_id],
+            temperature=0.7, max_tokens=300)
+        reply = resp.choices[0].message.content.strip()
+        kicked_user_chat_history[user_id].append({"role": "assistant", "content": reply})
+        return reply
+    except Exception:
+        return f"এই মুহূর্তে উত্তর দিতে পারছি না। Group admin-এর সাথে যোগাযোগ করো।"
+
+
 async def handle_kicked_user_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
-    Kick হওয়া ইউজার private-এ বটকে message করলে
-    ক্ষমার আবেদন process করো — progressive strictness।
+    Kick হওয়া ইউজার private-এ বটকে message করলে process করো।
+    - ১ম বার: সহজে ক্ষমা
+    - ২য় বার: কঠিন
+    - ২ বারের পর: AI conversation চলবে কিন্তু ক্ষমা নেই, admin link দেবে
     """
     msg  = update.message
     if not msg or not msg.text: return
@@ -2870,112 +2908,103 @@ async def handle_kicked_user_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = msg.text.strip()
 
     if u.id not in kicked_users:
-        return   # Kick হয়নি — normal handle_text চলবে
+        return
 
-    info = kicked_users[u.id]
-
-    # ৩য়+ attempt-এ already denied হলে সরাসরি admin পাঠাও
+    info    = kicked_users[u.id]
     attempt = forgive_attempt_count.get(u.id, 0)
+
+    # Admin-এর clickable link তৈরি করো
+    try:
+        owner_info = await ctx.bot.get_chat(OWNER_ID)
+        if owner_info.username:
+            admin_btn_url = f"https://t.me/{owner_info.username}"
+            admin_link    = f"[Admin](https://t.me/{owner_info.username})"
+        else:
+            admin_btn_url = f"tg://user?id={OWNER_ID}"
+            admin_link    = f"[Admin](tg://user?id={OWNER_ID})"
+    except Exception:
+        admin_btn_url = f"tg://user?id={OWNER_ID}"
+        admin_link    = f"[Admin](tg://user?id={OWNER_ID})"
+
+    admin_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📩 Admin-কে Message করো", url=admin_btn_url)]
+    ])
+
+    # ইতিমধ্যে ক্ষমা পেয়েছে
     if info.get('forgiven'):
         await msg.reply_text(
-            "✅ তোমাকে আগেই ক্ষমা করা হয়েছে এবং group-এ ফিরে যাওয়ার সুযোগ দেওয়া হয়েছে।"
+            "✅ তোমাকে আগেই ক্ষমা করা হয়েছে। Group link দিয়ে ফিরে যাও।"
         )
         return
 
-    if attempt >= 3:
-        # ৩ বারের বেশি — আর ক্ষমা নেই
-        admin_id = OWNER_ID
-        await msg.reply_text(
-            "🚫 *তোমার ক্ষমার সুযোগ শেষ হয়ে গেছে।*\n\n"
-            f"তুমি ইতিমধ্যে ৩ বার নিয়ম ভেঙেছ। AI আর ক্ষমা করতে পারবে না।\n\n"
-            f"📞 *Group Admin-এর সাথে যোগাযোগ করো:*\n"
-            f"Admin ID: `{admin_id}`\n"
-            f"তাকে সরাসরি message করো এবং তোমার বিষয়টা ব্যাখ্যা করো।",
-            parse_mode='Markdown'
+    # ২ বারের পর — AI conversation, কিন্তু ক্ষমা নেই
+    if attempt >= 2:
+        await ctx.bot.send_chat_action(msg.chat_id, "typing")
+        loop  = asyncio.get_event_loop()
+        reply = await loop.run_in_executor(
+            executor,
+            functools.partial(kicked_ai_chat_sync, u.id, u.first_name, text, admin_link)
         )
+        await msg.reply_text(reply, parse_mode='Markdown', reply_markup=admin_keyboard)
         return
 
-    # Attempt count বাড়াও
+    # ── ক্ষমার সুযোগ আছে (attempt 0 বা 1) ──
     forgive_attempt_count[u.id] = attempt + 1
-
-    # কতবার চেষ্টা হচ্ছে জানাও
-    attempt_labels = ["প্রথমবার", "দ্বিতীয়বার", "তৃতীয়বার"]
-    attempt_label  = attempt_labels[min(attempt, 2)]
 
     await ctx.bot.send_chat_action(msg.chat_id, "typing")
     loop = asyncio.get_event_loop()
-
-    # Admin contact তৈরি করো
-    admin_contact = f"Bot Owner ID: `{OWNER_ID}`"
 
     forgiven, reply = await loop.run_in_executor(
         executor,
         functools.partial(
             check_forgiveness_sync,
-            u.id,
-            u.first_name,
-            text,
+            u.id, u.first_name, text,
             info.get('reasons', []),
-            admin_contact
+            admin_link
         )
     )
 
     if forgiven:
         info['forgiven'] = True
         try:
-            await ctx.bot.unban_chat_member(
-                info['chat_id'], u.id,
-                only_if_banned=True)
-
+            await ctx.bot.unban_chat_member(info['chat_id'], u.id, only_if_banned=True)
             try:
                 invite = await ctx.bot.create_chat_invite_link(
-                    info['chat_id'],
-                    member_limit=1,
-                    expire_date=int(time.time()) + 3600
-                )
+                    info['chat_id'], member_limit=1,
+                    expire_date=int(time.time()) + 3600)
                 invite_link = invite.invite_link
             except Exception:
                 invite_link = None
 
-            # ১ম বার vs পরের বার আলাদা message
-            if attempt == 0:
-                header = "✅ *ক্ষমার আবেদন গৃহীত হয়েছে।*"
-            else:
-                header = f"✅ *{attempt_label} চেষ্টায় ক্ষমা পেয়েছ — এটাই শেষ সুযোগ।*"
-
+            header   = "✅ *ক্ষমার আবেদন গৃহীত হয়েছে।*" if attempt == 0 \
+                       else "✅ *ক্ষমা পেয়েছ — এটাই শেষ সুযোগ।*"
             dm_reply = f"{header}\n\n_{reply}_\n\n━━━━━━━━━━━━━━━━━━━━━\n"
             if invite_link:
-                dm_reply += (
-                    f"🔗 Group-এ ফিরে যাও: {invite_link}\n"
-                    f"_(১ ঘণ্টার মধ্যে যোগ দাও)_"
-                )
+                dm_reply += f"🔗 Group-এ ফিরে যাও: {invite_link}\n_(১ ঘণ্টার মধ্যে যোগ দাও)_"
 
             await msg.reply_text(dm_reply, parse_mode='Markdown')
-
             try:
                 await ctx.bot.send_message(
                     info['chat_id'],
-                    f"✅ {u.first_name} ক্ষমা চেয়েছে এবং আবার group-এ যোগ দেওয়ার সুযোগ পেয়েছে।"
-                )
-            except Exception:
-                pass
+                    f"✅ {u.first_name} ক্ষমা চেয়েছে এবং আবার group-এ যোগ দেওয়ার সুযোগ পেয়েছে।")
+            except Exception: pass
 
         except Exception as e:
             logger.error(f"Unban failed: {e}")
-            await msg.reply_text("❌ Ban তুলতে সমস্যা হয়েছে। Admin-কে জানাও।")
+            await msg.reply_text("❌ Ban তুলতে সমস্যা হয়েছে।", reply_markup=admin_keyboard)
     else:
-        # Denied — remaining attempts জানাও
-        remaining = max(0, 3 - forgive_attempt_count.get(u.id, 1))
-        extra = ""
-        if remaining > 0:
-            extra = f"\n\n_আরো {remaining} বার চেষ্টা করতে পারবে।_"
+        new_attempt = forgive_attempt_count.get(u.id, 1)
+        if new_attempt >= 2:
+            extra = "\n\n🚫 *তোমার ক্ষমার সুযোগ শেষ।* এখন Admin-এর সাথে কথা বলো।"
+            await msg.reply_text(
+                f"❌ *ক্ষমার আবেদন প্রত্যাখ্যাত।*\n\n{reply}{extra}",
+                parse_mode='Markdown', reply_markup=admin_keyboard)
         else:
-            extra = f"\n\n🚫 _আর কোনো সুযোগ নেই। Admin-এর সাথে যোগাযোগ করো।_"
-
-        await msg.reply_text(
-            f"❌ *ক্ষমার আবেদন প্রত্যাখ্যাত।*\n\n{reply}{extra}",
-            parse_mode='Markdown'
-        )
+            remaining = 2 - new_attempt
+            extra = f"\n\n_আরো {remaining} বার চেষ্টার সুযোগ আছে।_"
+            await msg.reply_text(
+                f"❌ *ক্ষমার আবেদন প্রত্যাখ্যাত।*\n\n{reply}{extra}",
+                parse_mode='Markdown')
 
 # ── Group Commands ──
 async def is_group_admin(chat_id: int, user_id: int, bot) -> bool:
