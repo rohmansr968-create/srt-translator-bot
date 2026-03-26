@@ -2467,14 +2467,88 @@ async def auto_delete_after(bot, chat_id: int, msg_id: int, delay: float):
         pass
 
 
+# User preferences per chat
+# { (chat_id, user_id): {'no_delete': bool, 'no_reply': bool} }
+user_msg_prefs = {}
+
+# User অভিযোগ detect + request detect system
+REQUEST_DETECT_SYSTEM = """তুমি একটি Telegram group message বিশ্লেষণ করছ।
+নিচের যেকোনো একটি type বের করো:
+
+1. "keep_message" — user চায় message বেশিক্ষণ রাখা হোক / মুছা না হোক
+2. "delete_message" — user চায় আগের মতো auto-delete চলুক  
+3. "no_reply" — user চায় bot তাকে reply না করুক
+4. "resume_reply" — user চায় bot আবার reply করুক
+5. "complaint" — user অন্য একজন member সম্পর্কে অভিযোগ করছে। JSON-এ "target_name" এবং "complaint_text" দাও
+6. "none" — সাধারণ কথা, কোনো request নয়
+
+Reply ONLY with valid JSON, nothing else:
+{"type": "keep_message"}
+{"type": "no_reply"}
+{"type": "complaint", "target_name": "নাম", "complaint_text": "অভিযোগ"}
+{"type": "none"}"""
+
+COMPLAINT_VERIFY_SYSTEM = (
+    "You are a fair group moderator AI. "
+    "A user has complained about another member. "
+    "Based on the recent group conversation history provided, "
+    "determine if the complaint is VALID (supported by evidence in history) or INVALID. "
+    "Reply ONLY with JSON: {\"verdict\": \"VALID\", \"reason\": \"কারণ বাংলায়\"} "
+    "or {\"verdict\": \"INVALID\", \"reason\": \"কারণ বাংলায়\"}"
+)
+
+
+def detect_user_request_sync(text: str) -> dict:
+    """User-এর request/complaint detect করো"""
+    import json
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": REQUEST_DETECT_SYSTEM},
+                {"role": "user",   "content": text[:400]}
+            ],
+            temperature=0.0, max_tokens=80)
+        raw = resp.choices[0].message.content.strip()
+        raw = raw.replace("```json","").replace("```","").strip()
+        return json.loads(raw)
+    except Exception:
+        return {"type": "none"}
+
+
+def verify_complaint_sync(complaint_text: str, history: list) -> dict:
+    """অভিযোগ সত্য কিনা history দেখে যাচাই করো"""
+    import json
+    history_text = "\n".join(
+        f"{m['role']}: {m['content']}" for m in history[-20:]
+    )
+    prompt = (
+        f"Recent group conversation:\n{history_text}\n\n"
+        f"Complaint: {complaint_text}"
+    )
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": COMPLAINT_VERIFY_SYSTEM},
+                {"role": "user",   "content": prompt}
+            ],
+            temperature=0.1, max_tokens=150)
+        raw = resp.choices[0].message.content.strip()
+        raw = raw.replace("```json","").replace("```","").strip()
+        return json.loads(raw)
+    except Exception:
+        return {"verdict": "INVALID", "reason": "যাচাই করা সম্ভব হয়নি।"}
+
+
 async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """গ্রুপের সব মেসেজ handle করো"""
     msg = update.message
     if not msg or not msg.text:
         return
 
-    chat_id  = msg.chat_id
-    user     = msg.from_user
+    chat_id = msg.chat_id
+    user    = msg.from_user
     if not user or user.is_bot:
         return
 
@@ -2488,13 +2562,13 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if user.username:
         name_id_cache[(chat_id, user.username.lower())] = user.id
 
-    loop = asyncio.get_event_loop()
+    loop     = asyncio.get_event_loop()
+    pref_key = (chat_id, user.id)
 
     # ── Step 1: Obscene check ──
     is_bad = await loop.run_in_executor(executor, is_obscene_sync, text)
 
     if is_bad:
-        # মেসেজ মুছো
         try:
             await msg.delete()
         except Exception:
@@ -2504,18 +2578,15 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         group_warns[key] = group_warns.get(key, 0) + 1
         warn_count = group_warns[key]
 
-        # Warn reason সেভ করো
         if key not in warn_reasons:
             warn_reasons[key] = []
         warn_reasons[key].append(f"অনুপযুক্ত মেসেজ (#{warn_count})")
 
         if warn_count >= 3:
-            # Kick করো
             try:
                 await ctx.bot.ban_chat_member(chat_id, user.id)
                 group_warns.pop(key, None)
 
-                # Kick কারণ সেভ করো
                 reasons = warn_reasons.get(key, ["গ্রুপের নিয়ম লঙ্ঘন"])
                 kicked_users[user.id] = {
                     'chat_id':  chat_id,
@@ -2523,11 +2594,8 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     'reasons':  reasons,
                     'forgiven': False,
                 }
-                # নতুন kick = attempt count রিসেট করো না,
-                # পুরনো count রাখো যাতে পরের ক্ষমা আরো কঠিন হয়
                 warn_reasons.pop(key, None)
 
-                # Group-এ kick notification
                 kick_notif = await ctx.bot.send_message(
                     chat_id,
                     f"🚫 {user.first_name} কে ৩টি সতর্কতার পরে গ্রুপ থেকে বের করা হয়েছে।"
@@ -2535,39 +2603,133 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 asyncio.create_task(
                     auto_delete_after(ctx.bot, chat_id, kick_notif.message_id, 30))
 
-                # ব্যক্তিগতভাবে DM করো — কেন kick হলো বিস্তারিত
-                reasons_text = "\n".join(f"\u2022 {r}" for r in reasons)
+                reasons_text = "\n".join(f"• {r}" for r in reasons)
                 dm_text = (
-                    f"\U0001f6ab *\u062a\u09cb\u09ae\u09be\u0995\u09c7 \u0997\u09cd\u09b0\u09c1\u09aa \u09a5\u09c7\u0995\u09c7 \u09ac\u09c7\u09b0 \u0995\u09b0\u09be \u09b9\u09df\u09c7\u099b\u09c7\u0964*\n\n"
-                    f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                    f"\U0001f4cb *\u0995\u09be\u09b0\u09a3:*\n{reasons_text}\n\n"
-                    f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                    f"\U0001f4ac \u09af\u09a6\u09bf \u09ae\u09a8\u09c7 \u0995\u09b0\u09cb \u098f\u099f\u09be \u09ad\u09c1\u09b2 \u09b9\u09df\u09c7\u099b\u09c7 \u09ac\u09be \u0995\u09cd\u09b7\u09ae\u09be \u099a\u09be\u0987\u09a4\u09c7 \u099a\u09be\u0993,\n"
-                    "\u098f\u0996\u09be\u09a8\u09c7 \u09b2\u09c7\u0996\u09cb \u2014 AI \u09ac\u09bf\u09ac\u09c7\u099a\u09a8\u09be \u0995\u09b0\u09ac\u09c7\u0964\n\n"
-                    "_\u09b8\u09a4\u09cd\u09af\u09bf\u0995\u09be\u09b0\u09c7\u09b0 \u0985\u09a8\u09c1\u09a4\u09be\u09aa \u09a6\u09c7\u0996\u09be\u09b2\u09c7 \u098f\u0995\u09ac\u09be\u09b0 \u09b8\u09c1\u09af\u09cb\u0997 \u09a6\u09c7\u0993\u09af\u09bc\u09be \u09b9\u09a4\u09c7 \u09aa\u09be\u09b0\u09c7\u0964_"
+                    f"🚫 *তোমাকে গ্রুপ থেকে বের করা হয়েছে।*\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📋 *কারণ:*\n{reasons_text}\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💬 যদি মনে করো এটা ভুল হয়েছে বা ক্ষমা চাইতে চাও,\n"
+                    f"এখানে লেখো — AI বিবেচনা করবে।\n\n"
+                    f"_সত্যিকারের অনুতাপ দেখালে একবার সুযোগ দেওয়া হতে পারে।_"
                 )
                 try:
-                    await ctx.bot.send_message(
-                        user.id, dm_text, parse_mode='Markdown')
+                    await ctx.bot.send_message(user.id, dm_text, parse_mode='Markdown')
                 except Exception:
-                    pass   # ইউজার DM বন্ধ করে রাখলে skip
+                    pass
 
             except Exception as e:
                 logger.warning(f"Kick failed: {e}")
 
         else:
-            # Warn notification
             warn_notif = await ctx.bot.send_message(
                 chat_id,
-                f"Warning {warn_count}/3: {user.first_name} - message removed for rule violation."
+                f"⚠️ Warning {warn_count}/3: {user.first_name} — অনুপযুক্ত মেসেজ মুছে দেওয়া হয়েছে।"
             )
             asyncio.create_task(
                 auto_delete_after(ctx.bot, chat_id, warn_notif.message_id, 30))
         return
 
-    # ── Step 2: AI reply — history সহ ──
+    # ── Step 2: User preference / complaint request check ──
+    if chat_id in group_ai_on:
+        req = await loop.run_in_executor(executor, detect_user_request_sync, text)
+        req_type = req.get("type", "none")
+
+        if req_type == "keep_message":
+            prefs = user_msg_prefs.get(pref_key, {})
+            prefs['no_delete'] = True
+            user_msg_prefs[pref_key] = prefs
+            notif = await msg.reply_text(
+                f"✅ {user.first_name}, তোমার জন্য message বেশিক্ষণ রাখা হবে।"
+            )
+            asyncio.create_task(auto_delete_after(ctx.bot, chat_id, notif.message_id, 20))
+            return
+
+        elif req_type == "delete_message":
+            prefs = user_msg_prefs.get(pref_key, {})
+            prefs['no_delete'] = False
+            user_msg_prefs[pref_key] = prefs
+            notif = await msg.reply_text(
+                f"✅ {user.first_name}, স্বাভাবিক auto-delete চালু হয়েছে।"
+            )
+            asyncio.create_task(auto_delete_after(ctx.bot, chat_id, notif.message_id, 20))
+            return
+
+        elif req_type == "no_reply":
+            prefs = user_msg_prefs.get(pref_key, {})
+            prefs['no_reply'] = True
+            user_msg_prefs[pref_key] = prefs
+            notif = await msg.reply_text(
+                f"✅ {user.first_name}, তোমার message-এ আর reply করব না।"
+            )
+            asyncio.create_task(auto_delete_after(ctx.bot, chat_id, notif.message_id, 20))
+            return
+
+        elif req_type == "resume_reply":
+            prefs = user_msg_prefs.get(pref_key, {})
+            prefs['no_reply'] = False
+            user_msg_prefs[pref_key] = prefs
+            notif = await msg.reply_text(
+                f"✅ {user.first_name}, আবার তোমাকে reply করব।"
+            )
+            asyncio.create_task(auto_delete_after(ctx.bot, chat_id, notif.message_id, 20))
+            return
+
+        elif req_type == "complaint":
+            target_name   = req.get("target_name", "")
+            complaint_txt = req.get("complaint_text", text)
+            if target_name:
+                # History দিয়ে অভিযোগ যাচাই করো
+                hist = group_history.get(chat_id, [])
+                verdict_data = await loop.run_in_executor(
+                    executor,
+                    functools.partial(verify_complaint_sync, complaint_txt, hist)
+                )
+                verdict = verdict_data.get("verdict", "INVALID")
+                reason  = verdict_data.get("reason", "")
+
+                if verdict == "VALID":
+                    # Target member খোঁজো এবং warn দাও
+                    target_id = name_id_cache.get((chat_id, target_name.lower()))
+                    if target_id:
+                        t_key = (chat_id, target_id)
+                        group_warns[t_key] = group_warns.get(t_key, 0) + 1
+                        wc = group_warns[t_key]
+                        if t_key not in warn_reasons:
+                            warn_reasons[t_key] = []
+                        warn_reasons[t_key].append(f"অভিযোগ সত্য প্রমাণিত: {complaint_txt[:60]}")
+                        warn_msg = await msg.reply_text(
+                            f"⚠️ অভিযোগ যাচাই করা হয়েছে।\n"
+                            f"*{target_name}* কে warning দেওয়া হয়েছে ({wc}/3)।\n"
+                            f"কারণ: {reason}",
+                            parse_mode='Markdown'
+                        )
+                        asyncio.create_task(
+                            auto_delete_after(ctx.bot, chat_id, warn_msg.message_id, 30))
+                    else:
+                        notif = await msg.reply_text(
+                            f"⚠️ অভিযোগ সত্য মনে হচ্ছে, কিন্তু '{target_name}' কে চিনতে পারছি না।\n"
+                            f"তাদের @username বা একটু আগের message দরকার।"
+                        )
+                        asyncio.create_task(
+                            auto_delete_after(ctx.bot, chat_id, notif.message_id, 30))
+                else:
+                    notif = await msg.reply_text(
+                        f"ℹ️ অভিযোগ যাচাই করা হয়েছে — যথেষ্ট প্রমাণ পাওয়া যায়নি।\n_{reason}_",
+                        parse_mode='Markdown'
+                    )
+                    asyncio.create_task(
+                        auto_delete_after(ctx.bot, chat_id, notif.message_id, 30))
+                return
+
+    # ── Step 3: AI reply ──
     if chat_id not in group_ai_on:
-        return   # AI off থাকলে reply দেবে না
+        return
+
+    # no_reply preference চেক
+    if user_msg_prefs.get(pref_key, {}).get('no_reply'):
+        return
+
     await ctx.bot.send_chat_action(chat_id, "typing")
 
     user_name  = user.first_name or user.username or "Someone"
@@ -2580,9 +2742,11 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if reply_text:
         try:
             sent = await msg.reply_text(reply_text)
-            read_time = calc_read_time(reply_text)
-            asyncio.create_task(
-                auto_delete_after(ctx.bot, chat_id, sent.message_id, read_time))
+            pref = user_msg_prefs.get(pref_key, {})
+            if not pref.get('no_delete'):
+                read_time = calc_read_time(reply_text)
+                asyncio.create_task(
+                    auto_delete_after(ctx.bot, chat_id, sent.message_id, read_time))
         except Exception as e:
             logger.warning(f"Group reply failed: {e}")
 
