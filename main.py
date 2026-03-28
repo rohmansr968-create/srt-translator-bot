@@ -105,6 +105,8 @@ user_state    = {}
 image_tasks   = {}   # {uid: cancel_flag}
 group_ai_on   = set()   # chat_ids where group AI is enabled
 group_warns   = {}       # {(chat_id, uid): count}
+kick_count    = {}       # {user_id: int} — কতবার গ্রুপ থেকে kick হয়েছে
+kick_mode     = {}       # {user_id: 'forgive'|'bot'} — kicked user কোন mode চেয়েছে
 
 # ══════════════════════════════════════════════
 # 🗄️  DATABASE
@@ -1215,6 +1217,60 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                       reply_markup=kb_not_joined())
         return
 
+    # ── Kicked user option buttons ──
+    if d == "kicked_forgive":
+        await q.answer()
+        kick_mode[uid] = 'forgive'
+        kc = kick_count.get(uid, 1)
+        if kc >= 2:
+            # ২য় বা তার বেশি kick — সরাসরি admin button
+            try:
+                group_chat_id = kicked_users.get(uid, {}).get('chat_id')
+                admin_kb_rows = []
+                if group_chat_id:
+                    try:
+                        admins = await ctx.bot.get_chat_administrators(group_chat_id)
+                        for adm in admins:
+                            if adm.user.is_bot: continue
+                            name = adm.user.first_name or adm.user.username or "Admin"
+                            url  = f"https://t.me/{adm.user.username}" if adm.user.username else f"tg://user?id={adm.user.id}"
+                            admin_kb_rows.append([InlineKeyboardButton(f"📩 {name}-কে Message করো", url=url)])
+                    except Exception: pass
+                if not admin_kb_rows:
+                    admin_kb_rows = [[InlineKeyboardButton("📩 Admin-কে Message করো", url=f"tg://user?id={OWNER_ID}")]]
+                await q.edit_message_text(
+                    "🚫 *তোমার ক্ষমার সুযোগ আর নেই।*\n\n"
+                    "তুমি ইতিমধ্যে একাধিকবার গ্রুপ থেকে বের হয়েছ।\n"
+                    "এখন সরাসরি group admin-এর সাথে যোগাযোগ করো 👇",
+                    parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup(admin_kb_rows))
+            except Exception:
+                await q.edit_message_text("🚫 আর ক্ষমার সুযোগ নেই। Admin-এর সাথে যোগাযোগ করো।")
+        else:
+            # ১ম kick — ক্ষমার সুযোগ আছে
+            await q.edit_message_text(
+                "🙏 *ক্ষমার আবেদন*\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "তোমার ক্ষমা চাওয়ার কারণ এখানে লেখো।\n"
+                "আন্তরিকভাবে লিখলে বিবেচনা করা হবে।\n\n"
+                "_সত্যিকারের অনুতাপ দেখালে সুযোগ পেতে পারো।_",
+                parse_mode='Markdown')
+        return
+
+    if d == "kicked_bot":
+        await q.answer()
+        kick_mode[uid] = 'bot'
+        # Bot features-এ ঢুকতে দাও (kicked_users থেকে সরাই না, শুধু mode set করি)
+        try:
+            await q.edit_message_text(
+                "🤖 *Bot Features*\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "স্বাগতম! Bot-এর সব feature ব্যবহার করতে পারো।\n"
+                "নিচের যেকোনো option বেছে নাও 👇",
+                parse_mode='Markdown', reply_markup=kb_home())
+        except Exception: pass
+        return
+
     if d.startswith("cancel_"):
         await q.answer()
         target = int(d.split("_")[1])
@@ -1630,9 +1686,17 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data['awaiting_search'] = False
         ctx.user_data.pop('yt_url_pending', None)
         user_state.pop(uid, None)
-        await q.edit_message_text(
-            "🎬 *Subtitle BD Bot*\n\nফাইল বা YouTube link পাঠাও! 🚀",
-            parse_mode='Markdown', reply_markup=kb_home())
+        home_text = "🎬 *Subtitle BD Bot*\n\nফাইল বা YouTube link পাঠাও! 🚀"
+        try:
+            await q.edit_message_text(home_text, parse_mode='Markdown', reply_markup=kb_home())
+        except Exception:
+            # Photo বা Document message-এ edit_message_text কাজ করে না
+            # তাই নতুন message পাঠাই এবং পুরনোটা delete করি
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
+            await q.message.reply_text(home_text, parse_mode='Markdown', reply_markup=kb_home())
 
 
 # ══════════════════════════════════════════════
@@ -1967,8 +2031,12 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Kicked user private DM check
     if u.id in kicked_users:
-        await handle_kicked_user_dm(update, ctx)
-        return
+        # 'bot' mode-এ থাকলে normal bot হিসেবে use করতে দাও
+        if kick_mode.get(u.id) == 'bot':
+            pass   # নিচে continue করবে (normal bot flow)
+        else:
+            await handle_kicked_user_dm(update, ctx)
+            return
 
     if not await check_access(u.id, ctx.bot, update.message.reply_text): return
     user  = get_user(u.id, u.username, u.first_name)
@@ -2322,34 +2390,31 @@ FORGIVE_SYSTEMS = [
         "You are a warm and compassionate group moderator for a Bengali Telegram group. "
         "This is the user's FIRST offense. Be very forgiving and empathetic. "
         "ALWAYS FORGIVE if there is any sign of remorse or apology, even a simple one. "
-        "CRITICAL: Never ever mention 'Groq', 'Llama', 'OpenAI', 'GPT', 'AI', 'artificial intelligence', "
-        "or any AI/model name. Do NOT say you are an AI or bot. "
-        "Speak naturally as a human group moderator would. "
-        "Reply ONLY: FORGIVEN or DENIED on line 1. "
-        "Then a short warm Bengali message welcoming them back."
+        "CRITICAL: Never mention 'Groq', 'Llama', 'OpenAI', 'GPT', 'AI', or any AI/model name. "
+        "Do NOT say you are an AI or bot. Speak as a human group moderator. "
+        "Your response MUST start with exactly the word FORGIVEN or DENIED on the first line. "
+        "Reply format:\nFORGIVEN\n(short warm Bengali message)\n\nor\n\nDENIED\n(short reason in Bengali)"
     ),
     # ২য় বার — মাঝারি কঠিন
     (
         "You are a firm group moderator for a Bengali Telegram group. "
-        "This user has broken rules TWICE before. Be more strict this time. "
+        "This user has broken rules TWICE before. Be more strict. "
         "Only forgive if the apology is detailed, sincere, and shows clear understanding of the mistake. "
-        "A simple sorry is NOT enough. They must explain specifically what they did wrong and promise firmly. "
-        "CRITICAL: Never ever mention 'Groq', 'Llama', 'OpenAI', 'GPT', 'AI', 'artificial intelligence', "
-        "or any AI/model name. Do NOT say you are an AI or bot. "
-        "Speak naturally as a human group moderator would. "
-        "Reply ONLY: FORGIVEN or DENIED on line 1. "
-        "Then a short Bengali message — if forgiven, warn this is their last chance; if denied, say why."
+        "A simple 'sorry' is NOT enough. "
+        "CRITICAL: Never mention 'Groq', 'Llama', 'OpenAI', 'GPT', 'AI', or any AI/model name. "
+        "Do NOT say you are an AI or bot. Speak as a human group moderator. "
+        "Your response MUST start with exactly the word FORGIVEN or DENIED on the first line. "
+        "Reply format:\nFORGIVEN\n(short Bengali message, warn this is last chance)\n\nor\n\nDENIED\n(short reason in Bengali)"
     ),
-    # ৩য় বার — খুব কঠিন
+    # ৩য় বার — খুব কঠিন (কখনো ক্ষমা নয়)
     (
         "You are a very strict group moderator for a Bengali Telegram group. "
-        "This user has broken rules THREE or more times. Do NOT forgive. Always DENY. "
-        "Tell them firmly they must contact the group admin directly. "
-        "CRITICAL: Never ever mention 'Groq', 'Llama', 'OpenAI', 'GPT', 'AI', 'artificial intelligence', "
-        "or any AI/model name. Do NOT say you are an AI or bot. "
-        "Speak naturally as a human group moderator would. "
-        "Reply ONLY: DENIED on line 1. "
-        "Then a short firm Bengali message saying they must contact the admin."
+        "This user has broken rules THREE or more times. ALWAYS DENY. Never forgive. "
+        "Tell them to contact the group admin. "
+        "CRITICAL: Never mention 'Groq', 'Llama', 'OpenAI', 'GPT', 'AI', or any AI/model name. "
+        "Do NOT say you are an AI or bot. Speak as a human group moderator. "
+        "Your response MUST start with exactly DENIED on the first line. "
+        "Reply format:\nDENIED\n(short firm Bengali message, say to contact admin)"
     ),
 ]
 
@@ -2450,10 +2515,25 @@ def check_forgiveness_sync(user_id: int, user_name: str,
             ],
             temperature=0.3, max_tokens=300)
         reply = resp.choices[0].message.content.strip()
-        forgiven = reply.upper().startswith("FORGIVEN")
+
+        # ── Robust parsing: first line check ──
+        first_line = reply.split('\n')[0].strip().upper()
+        # Groq/AI নাম mention করলে সেই অংশ বাদ দাও
+        for bad in ['GROQ', 'LLAMA', 'OPENAI', 'GPT', 'CLAUDE', 'CHATGPT']:
+            reply = reply.replace(bad, '').replace(bad.lower(), '').replace(bad.title(), '')
+
+        if 'FORGIVEN' in first_line:
+            forgiven = True
+        elif 'DENIED' in first_line:
+            forgiven = False
+        else:
+            # Fallback: যদি পরিষ্কার না হয়, 1st attempt-এ forgive করো
+            forgiven = (sys_idx == 0)
+
+        # FORGIVEN/DENIED word সরিয়ে clean reply
         clean_reply = reply.replace("FORGIVEN", "").replace("DENIED", "").strip()
         if not clean_reply:
-            clean_reply = "আবেদন পর্যালোচনা করা হয়েছে।"
+            clean_reply = "আবেদন পর্যালোচনা করা হয়েছে।" if not forgiven else "ক্ষমা করা হয়েছে।"
 
         # ৩য় বা তার বেশি attempt-এ DENY হলে admin contact যোগ করো
         if not forgiven and attempt >= 2 and admin_contact:
@@ -2605,6 +2685,11 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     'reasons':  reasons,
                     'forgiven': False,
                 }
+                # ── Kick count track করো ──
+                kick_count[user.id] = kick_count.get(user.id, 0) + 1
+                # নতুন kick-এ forgive attempt reset করো
+                forgive_attempt_count.pop(user.id, None)
+                kick_mode.pop(user.id, None)
                 warn_reasons.pop(key, None)
 
                 kick_notif = await ctx.bot.send_message(
@@ -2620,12 +2705,15 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     f"━━━━━━━━━━━━━━━━━━━━━\n"
                     f"📋 *কারণ:*\n{reasons_text}\n\n"
                     f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"💬 যদি মনে করো এটা ভুল হয়েছে বা ক্ষমা চাইতে চাও,\n"
-                    f"এখানে লেখো — AI বিবেচনা করবে।\n\n"
-                    f"_সত্যিকারের অনুতাপ দেখালে একবার সুযোগ দেওয়া হতে পারে।_"
+                    f"নিচের যেকোনো একটি বেছে নাও 👇"
                 )
+                dm_keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🙏 ক্ষমা চাইতে চাই",          callback_data="kicked_forgive")],
+                    [InlineKeyboardButton("🤖 Bot-এর Features ব্যবহার করো", callback_data="kicked_bot")],
+                ])
                 try:
-                    await ctx.bot.send_message(user.id, dm_text, parse_mode='Markdown')
+                    await ctx.bot.send_message(user.id, dm_text,
+                        parse_mode='Markdown', reply_markup=dm_keyboard)
                 except Exception:
                     pass
 
@@ -3043,8 +3131,8 @@ KICKED_AI_SYSTEM = (
     "তুমি তার সাথে সহানুভূতি দিয়ে কথা বলবে, কিন্তু clearly জানাবে যে "
     "আর ক্ষমা করা সম্ভব নয় — এই সিদ্ধান্ত final। "
     "সে যা-ই বলুক, তুমি তাকে group admin-এর সাথে যোগাযোগ করতে বলবে। "
-    "CRITICAL: কখনো 'Groq', 'Llama', 'OpenAI', 'GPT', 'AI', বা যেকোনো AI/model-এর নাম বলবে না। "
-    "নিজেকে AI বা bot বলে পরিচয় দেবে না। একজন human moderator-এর মতো কথা বলবে। "
+    "CRITICAL: কখনো 'Groq', 'Llama', 'OpenAI', 'GPT', 'AI' বা কোনো AI/model-এর নাম বলবে না। "
+    "নিজেকে AI বা bot পরিচয় দেবে না। Human moderator-এর মতো কথা বলবে। "
     "বাংলায় কথা বলো। সংক্ষিপ্ত উত্তর দাও।"
 )
 
@@ -3075,9 +3163,8 @@ def kicked_ai_chat_sync(user_id: int, user_name: str, text: str, admin_link: str
 async def handle_kicked_user_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     Kick হওয়া ইউজার private-এ বটকে message করলে process করো।
-    - ১ম বার: সহজে ক্ষমা
-    - ২য় বার: কঠিন
-    - ২ বারের পর: AI conversation চলবে কিন্তু ক্ষমা নেই, group admin-দের contact button
+    - ১ম kick: AI ক্ষমা করতে পারে (2 attempt)
+    - ২য় বা তার বেশি kick: শুধু admin button, ক্ষমা নেই
     """
     msg  = update.message
     if not msg or not msg.text: return
@@ -3087,71 +3174,62 @@ async def handle_kicked_user_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if u.id not in kicked_users:
         return
 
-    info    = kicked_users[u.id]
-    attempt = forgive_attempt_count.get(u.id, 0)
+    info          = kicked_users[u.id]
+    attempt       = forgive_attempt_count.get(u.id, 0)
     group_chat_id = info.get('chat_id')
+    kc            = kick_count.get(u.id, 1)   # কতবার kick হয়েছে
 
-    # ── Group admin-দের dynamically fetch করো ──
-    async def get_admin_keyboard(include_all: bool = False):
-        """Group-এর admin-দের contact button বানাও"""
-        buttons = []
-        try:
-            if group_chat_id:
+    # ── Dynamic admin button builder ──
+    async def get_admin_keyboard():
+        rows = []
+        if group_chat_id:
+            try:
                 admins = await ctx.bot.get_chat_administrators(group_chat_id)
-                for admin in admins:
-                    # bot বাদ দাও, শুধু human admin
-                    if admin.user.is_bot:
-                        continue
-                    name = admin.user.first_name or admin.user.username or "Admin"
-                    if admin.user.username:
-                        url = f"https://t.me/{admin.user.username}"
-                    else:
-                        url = f"tg://user?id={admin.user.id}"
-                    buttons.append(
-                        InlineKeyboardButton(f"📩 {name}-কে Message করো", url=url)
-                    )
-        except Exception:
-            pass
-
-        # Fallback: owner button
-        if not buttons:
+                for adm in admins:
+                    if adm.user.is_bot: continue
+                    name = adm.user.first_name or adm.user.username or "Admin"
+                    url  = f"https://t.me/{adm.user.username}" if adm.user.username \
+                           else f"tg://user?id={adm.user.id}"
+                    rows.append([InlineKeyboardButton(f"📩 {name}-কে Message করো", url=url)])
+            except Exception: pass
+        if not rows:
             try:
                 owner_info = await ctx.bot.get_chat(OWNER_ID)
-                if owner_info.username:
-                    url = f"https://t.me/{owner_info.username}"
-                else:
-                    url = f"tg://user?id={OWNER_ID}"
-                buttons.append(
-                    InlineKeyboardButton("📩 Admin-কে Message করো", url=url)
-                )
+                url = f"https://t.me/{owner_info.username}" if owner_info.username \
+                      else f"tg://user?id={OWNER_ID}"
             except Exception:
-                buttons.append(
-                    InlineKeyboardButton("📩 Admin-কে Message করো",
-                                         url=f"tg://user?id={OWNER_ID}")
-                )
-
-        # প্রতি row-এ ১টা করে button
-        return InlineKeyboardMarkup([[btn] for btn in buttons])
+                url = f"tg://user?id={OWNER_ID}"
+            rows = [[InlineKeyboardButton("📩 Admin-কে Message করো", url=url)]]
+        return InlineKeyboardMarkup(rows)
 
     # admin_link text (forgiveness function-এর জন্য)
     try:
         owner_info = await ctx.bot.get_chat(OWNER_ID)
-        if owner_info.username:
-            admin_link = f"[Admin](https://t.me/{owner_info.username})"
-        else:
-            admin_link = f"[Admin](tg://user?id={OWNER_ID})"
+        admin_link = f"[Admin](https://t.me/{owner_info.username})" if owner_info.username \
+                     else f"[Admin](tg://user?id={OWNER_ID})"
     except Exception:
         admin_link = f"[Admin](tg://user?id={OWNER_ID})"
 
-    # ইতিমধ্যে ক্ষমা পেয়েছে
+    # ── ইতিমধ্যে ক্ষমা পেয়েছে ──
     if info.get('forgiven'):
-        await msg.reply_text(
-            "✅ তোমাকে আগেই ক্ষমা করা হয়েছে। Group link দিয়ে ফিরে যাও।"
-        )
+        await msg.reply_text("✅ তোমাকে আগেই ক্ষমা করা হয়েছে। Group link দিয়ে ফিরে যাও।")
         return
 
-    # ── ৩য় বা তার বেশি attempt — ক্ষমা নেই, AI conversation + admin buttons ──
+    # ── ২য় বা তার বেশি kick — ক্ষমা নেই, admin button ──
+    if kc >= 2:
+        admin_kb = await get_admin_keyboard()
+        await ctx.bot.send_chat_action(msg.chat_id, "typing")
+        loop  = asyncio.get_event_loop()
+        reply = await loop.run_in_executor(
+            executor,
+            functools.partial(kicked_ai_chat_sync, u.id, u.first_name, text, admin_link)
+        )
+        await msg.reply_text(reply, parse_mode='Markdown', reply_markup=admin_kb)
+        return
+
+    # ── ১ম kick — ক্ষমার সুযোগ আছে (attempt 0 বা 1) ──
     if attempt >= 2:
+        # ২ বার try-এর পরেও ক্ষমা হয়নি — AI conversation + admin button
         await ctx.bot.send_chat_action(msg.chat_id, "typing")
         loop  = asyncio.get_event_loop()
         reply = await loop.run_in_executor(
@@ -3162,7 +3240,6 @@ async def handle_kicked_user_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(reply, parse_mode='Markdown', reply_markup=admin_kb)
         return
 
-    # ── ক্ষমার সুযোগ আছে (attempt 0 বা 1) ──
     forgive_attempt_count[u.id] = attempt + 1
 
     await ctx.bot.send_chat_action(msg.chat_id, "typing")
@@ -3210,7 +3287,7 @@ async def handle_kicked_user_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         new_attempt = forgive_attempt_count.get(u.id, 1)
         if new_attempt >= 2:
-            extra = "\n\n🚫 *তোমার ক্ষমার সুযোগ শেষ।* নিচের admin-এর সাথে যোগাযোগ করো।"
+            extra    = "\n\n🚫 *তোমার ক্ষমার সুযোগ শেষ।* Admin-এর সাথে যোগাযোগ করো।"
             admin_kb = await get_admin_keyboard()
             await msg.reply_text(
                 f"❌ *ক্ষমার আবেদন প্রত্যাখ্যাত।*\n\n{reply}{extra}",
